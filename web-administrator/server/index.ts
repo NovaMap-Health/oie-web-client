@@ -14,7 +14,7 @@ import * as crypto from 'crypto';
 import express from 'express';
 import type { Request, Response, NextFunction } from 'express';
 
-import { load } from './config';
+import { load, frameAncestorsCsp } from './config';
 import type { TlsConfig } from './config';
 import { createApiProxy } from './proxy';
 import { installPluginRoutes } from './plugin-install';
@@ -83,7 +83,7 @@ const cspFor = (nonce: string) => [
     "frame-src 'self' data:",
     "object-src 'none'",
     "base-uri 'self'",
-    "frame-ancestors 'none'"
+    frameAncestorsCsp(config.frameAncestors)
 ].join('; ');
 app.use((req: Request, res: Response, next: NextFunction) => {
     res.locals.cspNonce = crypto.randomBytes(16).toString('base64');
@@ -124,6 +124,7 @@ app.get('/webadmin/config.json', (_req: Request, res: Response) => {
     res.json({
         engines: config.engines.map((e) => ({ key: e.key, name: e.name })),
         devMode: !!config.devMode,
+        embed: config.frameAncestors.length > 0,
         version: buildInfo.version,
         build: { commit: buildInfo.commit || null, dirty: !!buildInfo.dirty, date: buildInfo.date || null },
         codeTemplateCompletions: config.codeTemplateCompletions !== false
@@ -230,6 +231,12 @@ async function start() {
             console.log(`  Engine:  ${config.engines[0].url} (TLS verify: ${config.engines[0].verifyTls})`);
         }
         if (config.devMode) console.log('  devMode: ON — a login-entered engine URL will be proxied (trusted deployments only)');
+        if (config.frameAncestors.length) {
+            console.log(`  Embed:   ${frameAncestorsCsp(config.frameAncestors)}`);
+            if (!config.tls) {
+                console.log('           Cross-site iframe cookies need HTTPS (terminate TLS upstream or set config.tls).');
+            }
+        }
         console.log(`  Version: ${buildInfo.version}${buildInfo.commit ? ` (${String(buildInfo.commit).slice(0, 7)}${buildInfo.dirty ? '-dirty' : ''})` : ''}`);
         console.log(`  Plugins: ${loaded.length} loaded`);
         // Bind-posture warning: on a routable interface without TLS, the proxy

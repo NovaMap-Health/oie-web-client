@@ -66,6 +66,7 @@ is missing or invalid stops startup instead of silently using defaults.
 | `devMode` | `WEBADMIN_DEV_MODE` | `false` | Adds a free-form engine URL field at login (the proxy forwards to whatever is typed — trusted/dev deployments only) |
 | `pluginDirs` | `WEBADMIN_PLUGIN_DIRS` | `[]` | Additional **local** plugin directories scanned alongside the bundled `./plugins` (e.g. for local development). The env var uses the platform path-list delimiter (`:` on Unix, `;` on Windows). Extensions installed on the engine are served by the engine, not stored here. |
 | `trustedProxies` | `WEBADMIN_TRUSTED_PROXIES` | `[]` | Peer IPs trusted to set `X-Forwarded-For` (a front TLS terminator / reverse proxy); loopback is always trusted. Comma-separated in the env var |
+| `frameAncestors` | `WEBADMIN_FRAME_ANCESTORS` | `[]` | Origins allowed to embed this UI in an iframe (`CSP frame-ancestors`). Empty → not embeddable. Comma-separated in the env var; never `*` |
 | `codeTemplateCompletions` | `WEBADMIN_CODE_TEMPLATE_COMPLETIONS` | `true` | Offer the channel's own code-template functions as script-editor completions; disable to avoid fetching very large catalogs |
 | `tls` | `WEBADMIN_TLS_KEY` / `WEBADMIN_TLS_CERT` / `WEBADMIN_TLS_PASSPHRASE` | `null` | Serve the web UI itself over HTTPS: `{ "key", "cert", "passphrase"? }` (PEM paths). Leave `null` to serve HTTP and terminate TLS in front |
 
@@ -118,7 +119,9 @@ Example `config.json`:
 > `/api/users/_login` and the engine's `JSESSIONID` cookie carries the session.
 > The Node server stores no credentials; it is a streaming reverse proxy.
 > For production, terminate TLS in front of this app (the session cookie should
-> not cross the network in clear text).
+> not cross the network in clear text). To iframe this UI from another origin,
+> set `frameAncestors` (see the table above); the default CSP is
+> `frame-ancestors 'none'`.
 
 ## Look & feel
 

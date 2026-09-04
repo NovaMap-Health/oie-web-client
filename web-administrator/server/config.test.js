@@ -15,11 +15,12 @@ const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 
-const { load, buildEngines } = require('./config');
+const { load, buildEngines, parseFrameAncestors, frameAncestorsCsp } = require('./config');
 
 const CONFIG_ENV = [
     'WEBADMIN_CONFIG', 'WEBADMIN_CONFIG_JSON', 'WEBADMIN_PORT', 'WEBADMIN_HOST',
-    'OIE_URL', 'OIE_VERIFY_TLS', 'WEBADMIN_TLS_KEY', 'WEBADMIN_TLS_CERT'
+    'OIE_URL', 'OIE_VERIFY_TLS', 'WEBADMIN_TLS_KEY', 'WEBADMIN_TLS_CERT',
+    'WEBADMIN_FRAME_ANCESTORS'
 ];
 function withEnv(env, fn) {
     const saved = {};
@@ -151,6 +152,71 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'webadmin-config-'));
     })[0].key;
     assert.strictEqual(nameKey('Café'), nameKey('Café'));
     console.log('ok: duplicate engine keys are rejected; keys are normalization-stable');
+}
+
+// --- frameAncestors: named origins only; empty / 'none' → not embeddable ------
+{
+    assert.deepStrictEqual(parseFrameAncestors(undefined), []);
+    assert.deepStrictEqual(parseFrameAncestors([]), []);
+    assert.deepStrictEqual(parseFrameAncestors(''), []);
+    assert.deepStrictEqual(parseFrameAncestors('none'), []);
+    assert.deepStrictEqual(parseFrameAncestors(["'none'"]), []);
+    assert.deepStrictEqual(parseFrameAncestors(['https://portal.example.com/']), ['https://portal.example.com']);
+    assert.deepStrictEqual(
+        parseFrameAncestors('self, https://portal.example.com, https://*.clients.example.com'),
+        ["'self'", 'https://portal.example.com', 'https://*.clients.example.com']
+    );
+    assert.deepStrictEqual(
+        parseFrameAncestors(['https://app.example.com:8443', 'https://app.example.com:8443']),
+        ['https://app.example.com:8443']
+    );
+    assert.strictEqual(frameAncestorsCsp([]), "frame-ancestors 'none'");
+    assert.strictEqual(
+        frameAncestorsCsp(["'self'", 'https://portal.example.com']),
+        "frame-ancestors 'self' https://portal.example.com"
+    );
+    assert.throws(() => parseFrameAncestors('*'), /cannot be \*/);
+    assert.throws(() => parseFrameAncestors(['https://portal.example.com/admin']), /no path/);
+    assert.throws(() => parseFrameAncestors(['ftp://portal.example.com']), /http\(s\)/);
+    assert.throws(() => parseFrameAncestors(['https://user:pass@portal.example.com']), /credentials/);
+    assert.throws(() => parseFrameAncestors(['none', 'https://portal.example.com']), /mix 'none'/);
+    assert.throws(() => parseFrameAncestors({ host: 'nope' }), /array of origins/);
+    console.log('ok: frameAncestors parses origins, rejects *, paths, and mixed none');
+}
+
+{
+    const config = withEnv({
+        WEBADMIN_CONFIG_JSON: JSON.stringify({
+            frameAncestors: ['https://from-doc.example.com']
+        }),
+        WEBADMIN_FRAME_ANCESTORS: 'https://from-env.example.com, https://other.example.com'
+    }, load);
+    assert.deepStrictEqual(config.frameAncestors, ['https://from-env.example.com', 'https://other.example.com']);
+    console.log('ok: WEBADMIN_FRAME_ANCESTORS overrides the document allowlist');
+}
+
+{
+    const config = withEnv({
+        WEBADMIN_CONFIG_JSON: JSON.stringify({
+            frameAncestors: ['https://from-doc.example.com']
+        }),
+        WEBADMIN_FRAME_ANCESTORS: ''
+    }, load);
+    assert.deepStrictEqual(config.frameAncestors, []);
+    console.log('ok: empty WEBADMIN_FRAME_ANCESTORS clears the allowlist');
+}
+
+{
+    let code = 0;
+    try {
+        execFileSync(process.execPath, ['-e', "require('./config').load()"], {
+            cwd: __dirname,
+            env: { ...process.env, WEBADMIN_FRAME_ANCESTORS: '*' },
+            stdio: 'pipe'
+        });
+    } catch (e) { code = e.status; }
+    assert.strictEqual(code, 1);
+    console.log('ok: invalid frameAncestors fail startup');
 }
 
 fs.rmSync(tmp, { recursive: true, force: true });

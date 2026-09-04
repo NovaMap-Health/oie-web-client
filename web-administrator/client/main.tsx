@@ -26,6 +26,12 @@ setDialogRenderer(openRadixDialog as any);
 setToastRenderer(showRadixToast as any);
 setContextMenuRenderer(openRadixContextMenu as any);
 
+try {
+    if (window.self !== window.top) document.documentElement.classList.add('oie-embedded');
+} catch {
+    document.documentElement.classList.add('oie-embedded');
+}
+
 // StrictMode covers the SHELL tree only. The per-view and per-island roots that
 // react/mount.jsx creates are separate roots outside <App>, so they are NOT
 // double-invoked by this — wrapping them too is a much riskier step, because the

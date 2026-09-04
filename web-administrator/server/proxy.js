@@ -197,18 +197,33 @@ function forceNoStore(headers) {
     return headers;
 }
 /** Apply the browser-facing session-cookie policy shared by the streaming proxy
- * and server-side OIDC callback login. */
-function rewriteSetCookies(cookies, secure) {
+ * and server-side OIDC callback login.
+ *
+ * `crossSite` is true when this UI may be iframed by another origin
+ * (`config.frameAncestors`). Third-party iframes only keep the engine session
+ * if the cookie is SameSite=None; Secure; Partitioned (CHIPS). That requires a
+ * secure browser hop — over plain HTTP we keep Lax, which still works for
+ * same-site embeds. Existing SameSite/Partitioned flags from Jetty are
+ * replaced so an engine default cannot leave the cookie unusable in a frame. */
+function rewriteSetCookies(cookies, secure, crossSite = false) {
     return (cookies || []).map((original) => {
-        let cookie = original;
-        if (!/;\s*samesite=/i.test(cookie))
-            cookie += '; SameSite=Lax';
-        if (secure) {
+        let cookie = original
+            .replace(/;\s*samesite=[^;]*/ig, '')
+            .replace(/;\s*partitioned\b/ig, '');
+        if (crossSite && secure) {
+            cookie += '; SameSite=None; Partitioned';
             if (!/;\s*secure\b/i.test(cookie))
                 cookie += '; Secure';
         }
-        else
-            cookie = cookie.replace(/;\s*secure\b/ig, '');
+        else {
+            cookie += '; SameSite=Lax';
+            if (secure) {
+                if (!/;\s*secure\b/i.test(cookie))
+                    cookie += '; Secure';
+            }
+            else
+                cookie = cookie.replace(/;\s*secure\b/ig, '');
+        }
         return cookie;
     });
 }
@@ -315,18 +330,21 @@ function createApiProxy(config) {
             }
             forceNoStore(resHeaders);
             // Reconcile the engine's session cookie with THIS connection's scheme as
-            // it crosses our origin. Add SameSite=Lax (CSRF defense-in-depth). When
-            // the front is HTTPS, add Secure. When the front is plain HTTP, STRIP any
-            // Secure flag the engine set (it serves over HTTPS and Jetty marks the
-            // JSESSIONID Secure): a browser silently drops a Secure cookie received
-            // over HTTP, so leaving it on breaks login on an HTTP deployment — and
-            // Secure protects nothing over a connection that's already plaintext.
+            // it crosses our origin. Default SameSite=Lax (CSRF defense-in-depth).
+            // When frameAncestors is set and the front is HTTPS, use SameSite=None
+            // so a cross-site parent iframe still receives the session. When the
+            // front is plain HTTP, STRIP any Secure flag the engine set (it serves
+            // over HTTPS and Jetty marks the JSESSIONID Secure): a browser silently
+            // drops a Secure cookie received over HTTP, so leaving it on breaks
+            // login on an HTTP deployment — and Secure protects nothing over a
+            // connection that's already plaintext.
             if (Array.isArray(resHeaders['set-cookie'])) {
                 // Trust the client's X-Forwarded-Proto only from a trusted fronting
                 // proxy; otherwise derive the scheme from the actual connection.
                 const proto = isTrustedPeer(req.socket.remoteAddress, trustedProxies) ? req.headers['x-forwarded-proto'] : undefined;
                 const secure = proto === 'https' || !!req.socket.encrypted;
-                resHeaders['set-cookie'] = rewriteSetCookies(resHeaders['set-cookie'], secure);
+                const crossSite = Array.isArray(config.frameAncestors) && config.frameAncestors.length > 0;
+                resHeaders['set-cookie'] = rewriteSetCookies(resHeaders['set-cookie'], secure, crossSite);
             }
             res.writeHead(upstreamRes.statusCode, resHeaders);
             upstreamRes.pipe(res);

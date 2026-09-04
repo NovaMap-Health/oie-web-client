@@ -57,6 +57,7 @@ Important settings:
 - `host` / `WEBADMIN_HOST` and `port` / `WEBADMIN_PORT` — listener.
 - `tls` / `WEBADMIN_TLS_*` — built-in HTTPS.
 - `trustedProxies` / `WEBADMIN_TRUSTED_PROXIES` — forwarding trust boundary.
+- `frameAncestors` / `WEBADMIN_FRAME_ANCESTORS` — origins allowed to iframe this UI. Empty keeps the default `frame-ancestors 'none'`. Cross-site embeds need HTTPS so the session cookie can be `SameSite=None`.
 - `pluginDirs` / `WEBADMIN_PLUGIN_DIRS` — additional local plugin directories.
 - `codeTemplateCompletions` — channel-aware code-template completion loading.
 

@@ -37,6 +37,10 @@
  *                        PEM key + cert (and optional passphrase) to serve the UI
  *                        over HTTPS directly. Both key and cert required to enable;
  *                        default is plain HTTP (terminate TLS at a reverse proxy).
+ *   WEBADMIN_FRAME_ANCESTORS
+ *                        Comma-separated origins allowed to iframe this UI
+ *                        (CSP frame-ancestors). Empty / unset → not embeddable
+ *                        (`frame-ancestors 'none'`). Never `*`.
  */
 
 import * as fs from 'fs';
@@ -59,6 +63,10 @@ export interface WebAdminConfig {
     pluginDirs: string[];
     engines: ResolvedEngine[];
     root: string;
+    /** Origins allowed to embed this UI in an iframe. Empty → CSP
+        `frame-ancestors 'none'` (not embeddable). Each entry is `'self'` or an
+        http(s) origin, optionally with a `*.` host wildcard. */
+    frameAncestors: string[];
     /** config.json is user-authored and may carry extra keys (e.g. plugin-specific
         settings); `unknown` keeps that openness while forcing readers to narrow. */
     [key: string]: unknown;
@@ -97,7 +105,11 @@ const defaults = {
     // (plain HTTP) — most deployments terminate TLS at a reverse proxy. Set
     // { key, cert, passphrase? } (PEM file paths, relative to the app root or
     // absolute) to serve HTTPS directly; both key and cert are required.
-    tls: null
+    tls: null,
+    // Origins allowed to iframe this UI (CSP frame-ancestors). Empty → 'none'.
+    // Cross-site embedding also needs HTTPS so the session cookie can be
+    // SameSite=None; Secure. Never `*` — name each parent origin.
+    frameAncestors: []
 };
 
 export function load(): WebAdminConfig {
@@ -144,6 +156,7 @@ export function load(): WebAdminConfig {
     if (process.env.WEBADMIN_DEV_MODE) config.devMode = process.env.WEBADMIN_DEV_MODE === 'true';
     if (process.env.WEBADMIN_CODE_TEMPLATE_COMPLETIONS) config.codeTemplateCompletions = process.env.WEBADMIN_CODE_TEMPLATE_COMPLETIONS === 'true';
     if (process.env.WEBADMIN_TRUSTED_PROXIES) config.trustedProxies = process.env.WEBADMIN_TRUSTED_PROXIES.split(',').map(s => s.trim()).filter(Boolean);
+    if (process.env.WEBADMIN_FRAME_ANCESTORS !== undefined) config.frameAncestors = process.env.WEBADMIN_FRAME_ANCESTORS;
 
     // Optional built-in TLS (config.json "tls" or the env vars below). Enabled only
     // when BOTH key and cert are given; paths resolve against the app root. Off →
@@ -177,6 +190,7 @@ export function load(): WebAdminConfig {
     // colliding keys fail startup (same posture as a broken config document).
     try {
         config.engines = buildEngines(config);
+        config.frameAncestors = parseFrameAncestors(config.frameAncestors);
     } catch (e) {
         console.error(`[config] ${(e as Error).message}`);
         process.exit(1);
@@ -250,4 +264,72 @@ export function buildEngines(config: Pick<WebAdminConfig, 'engine' | 'allowedUrl
         byKey.set(eng.key, eng.name);
     }
     return engines;
+}
+
+// Origins (and `'self'`) allowed to embed this UI. Empty / `'none'` → not
+// embeddable. Rejects `*` (an admin UI with PHI must name its parents), paths,
+// credentials, and non-http(s) schemes. Host wildcards (`https://*.example.com`)
+// are the CSP frame-ancestors form, not a full URL, so they are matched
+// separately. Exported for tests.
+export function parseFrameAncestors(raw: unknown): string[] {
+    const items = frameAncestorList(raw);
+    const out: string[] = [];
+    let sawNone = false;
+    for (const item of items) {
+        const token = String(item).trim();
+        if (!token) continue;
+        if (token === '*') {
+            throw new Error('frameAncestors cannot be * — name each parent origin (or \'self\')');
+        }
+        if (token === 'none' || token === "'none'") {
+            sawNone = true;
+            continue;
+        }
+        if (token === 'self' || token === "'self'") {
+            out.push("'self'");
+            continue;
+        }
+        const wildcard = /^(https?):\/\/\*\.([A-Za-z0-9.-]+)(?::(\d+))?\/?$/i.exec(token);
+        if (wildcard) {
+            const scheme = wildcard[1].toLowerCase();
+            const host = wildcard[2].toLowerCase();
+            const port = wildcard[3] ? ':' + wildcard[3] : '';
+            out.push(`${scheme}://*.${host}${port}`);
+            continue;
+        }
+        let url: URL;
+        try {
+            url = new URL(token);
+        } catch {
+            throw new Error(`frameAncestors entry is not a valid origin: ${token}`);
+        }
+        if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+            throw new Error(`frameAncestors entry must be an http(s) origin: ${token}`);
+        }
+        if (url.username || url.password) {
+            throw new Error(`frameAncestors entry must not include credentials: ${token}`);
+        }
+        if (url.search || url.hash || (url.pathname && url.pathname !== '/')) {
+            throw new Error(`frameAncestors entry must be an origin with no path: ${token}`);
+        }
+        out.push(url.origin);
+    }
+    if (sawNone && out.length) {
+        throw new Error("frameAncestors cannot mix 'none' with other origins");
+    }
+    if (sawNone) return [];
+    return [...new Set(out)];
+}
+
+/** CSP `frame-ancestors` directive for the resolved allowlist. */
+export function frameAncestorsCsp(origins: string[]): string {
+    if (!origins.length) return "frame-ancestors 'none'";
+    return 'frame-ancestors ' + origins.join(' ');
+}
+
+function frameAncestorList(raw: unknown): unknown[] {
+    if (raw == null || raw === '') return [];
+    if (Array.isArray(raw)) return raw;
+    if (typeof raw === 'string') return raw.split(',');
+    throw new Error('frameAncestors must be an array of origins or a comma-separated string');
 }

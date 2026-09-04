@@ -9,6 +9,7 @@
     "devMode": false,
     "pluginDirs": [],
     "trustedProxies": [],
+    "frameAncestors": [],
     "codeTemplateCompletions": true,
     "tls": null
 }

@@ -27,8 +27,19 @@ const STATUS_MESSAGES = {
 };
 
 // Session cookie (path=/ so it reaches /api), cleared by Switch Engine / sign-out.
+// Inside a cross-origin iframe, Lax cookies are third-party and the browser
+// will not send them on /api calls — SameSite=None; Secure; Partitioned is
+// required (and only legal in a secure context).
+function cookieAttrs(): string {
+    let embedded = false;
+    try { embedded = window.self !== window.top; } catch { embedded = true; }
+    if (embedded && window.isSecureContext) {
+        return 'path=/; samesite=none; secure; partitioned';
+    }
+    return 'path=/; samesite=lax';
+}
 function setCookie(name: any, value: any) {
-    document.cookie = `${name}=${encodeURIComponent(value)}; path=/; samesite=lax`;
+    document.cookie = `${name}=${encodeURIComponent(value)}; ${cookieAttrs()}`;
 }
 function clearCookie(name: any) {
     document.cookie = `${name}=; path=/; max-age=0`;

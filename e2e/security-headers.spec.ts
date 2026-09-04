@@ -15,6 +15,7 @@ test.describe('security headers', () => {
         expect(h['x-content-type-options']).toBe('nosniff');
         expect(h['referrer-policy']).toBe('same-origin');
         expect(h['content-security-policy']).toContain("default-src 'self'");
+        expect(h['content-security-policy']).toContain("frame-ancestors 'none'");
         // x-powered-by is disabled so the server doesn't advertise Express.
         expect(h['x-powered-by']).toBeUndefined();
     });
@@ -45,6 +46,7 @@ test.describe('security headers', () => {
         // Engines are advertised by name only; no URL reaches the browser.
         expect(Array.isArray(cfg.engines)).toBeTruthy();
         expect(cfg).not.toHaveProperty('engineUrl');
+        expect(cfg.embed).toBe(false);
         for (const e of cfg.engines) {
             expect(e).toHaveProperty('name');
             expect(e).not.toHaveProperty('url');

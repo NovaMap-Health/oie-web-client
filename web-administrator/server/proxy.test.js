@@ -5,7 +5,7 @@
  * resolveForwardedFor (trusted-peer X-Forwarded-For).
  */
 const assert = require('assert');
-const { resolveEngine, resolveForwardedFor, isTrustedPeer, sanitizeForwardHeaders, forceNoStore } = require('./proxy.js');
+const { resolveEngine, resolveForwardedFor, isTrustedPeer, sanitizeForwardHeaders, forceNoStore, rewriteSetCookies } = require('./proxy.js');
 
 let failures = 0;
 function test(name, fn) {
@@ -145,6 +145,30 @@ test('forceNoStore: overrides upstream cache headers rather than only filling in
     assert.strictEqual(h['cache-control'], 'no-store');
     assert.strictEqual(h['expires'], undefined);
     assert.strictEqual(h['pragma'], undefined);
+});
+
+test('rewriteSetCookies: default (not embeddable) is SameSite=Lax; Secure follows the front hop', () => {
+    const [httpCookie] = rewriteSetCookies(['JSESSIONID=abc; Path=/api; Secure'], false);
+    assert.match(httpCookie, /SameSite=Lax/i);
+    assert.doesNotMatch(httpCookie, /;\s*Secure\b/i);
+    const [httpsCookie] = rewriteSetCookies(['JSESSIONID=abc; Path=/api'], true);
+    assert.match(httpsCookie, /SameSite=Lax/i);
+    assert.match(httpsCookie, /;\s*Secure\b/i);
+});
+
+test('rewriteSetCookies: embeddable + HTTPS replaces Jetty SameSite with None; Partitioned', () => {
+    const [cookie] = rewriteSetCookies(['JSESSIONID=abc; Path=/api; SameSite=Lax'], true, true);
+    assert.match(cookie, /SameSite=None/i);
+    assert.match(cookie, /;\s*Partitioned\b/i);
+    assert.match(cookie, /;\s*Secure\b/i);
+    assert.doesNotMatch(cookie, /SameSite=Lax/i);
+});
+
+test('rewriteSetCookies: embeddable over HTTP stays Lax — None requires Secure', () => {
+    const [cookie] = rewriteSetCookies(['JSESSIONID=abc; Path=/api; Secure'], false, true);
+    assert.match(cookie, /SameSite=Lax/i);
+    assert.doesNotMatch(cookie, /SameSite=None/i);
+    assert.doesNotMatch(cookie, /;\s*Secure\b/i);
 });
 
 /* A round trip through the real proxy, against a stub standing in for the engine.

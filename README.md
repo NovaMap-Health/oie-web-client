@@ -183,6 +183,46 @@ replace the image's default plain-HTTP healthcheck with an HTTPS-aware probe.
 Build the image yourself with `docker build -t oie-web-client .` from the repo
 root.
 
+### NetBird image
+
+A second image always joins [NetBird](https://netbird.io) at startup (userspace
+netstack, no extra capabilities) and then starts the same web administrator.
+There is no on/off flag — if the setup key or management URL is missing, the
+container exits. Access is over the mesh on port 3030; do not publish the port
+unless you also want host/LAN reachability.
+
+NovaMap builds publish it to GHCR as
+`ghcr.io/novamap-health/oie-web-client/netbird` (`latest` / `dev-latest` /
+`staging-latest`, plus version tags). Build it locally from the vanilla image:
+
+```bash
+docker build -t oie-web-client:local .
+docker build -f docker/netbird/Dockerfile \
+  --build-arg BASE_IMAGE=oie-web-client:local \
+  -t oie-web-client-netbird:local .
+```
+
+Required at runtime (file **or** env):
+
+| Role | File | Environment |
+|---|---|---|
+| Setup key (36-character UUID) | `/config/netbird/setup.key` | `NETBIRD_SETUP_KEY` |
+| Management URL | `/config/urls/netbird_management_url` | `NETBIRD_MANAGEMENT_URL` |
+| Peer hostname | `/etc/podinfo/handle` | `NETBIRD_HOSTNAME` (else the container hostname) |
+
+```bash
+docker run --rm \
+  -e OIE_URL=https://host.docker.internal:8443 \
+  -e NETBIRD_MANAGEMENT_URL=https://netbird.novamap.cloud \
+  -e NETBIRD_HOSTNAME=oie-webadmin \
+  -v "$PWD/setup.key:/config/netbird/setup.key:ro" \
+  oie-web-client-netbird:local
+```
+
+From a NetBird-connected client, open `http://<peer-ip>:3030`. A NetBird policy
+must allow your user/group to that peer on TCP 3030. A minikube smoke-test
+manifest is in `docker/netbird/minikube.yaml`.
+
 ## Node/Docker configuration
 
 Settings load from a single JSON **config document**, then per-setting
@@ -204,6 +244,7 @@ than silently booting on defaults. Start from
 | `devMode` | `WEBADMIN_DEV_MODE` | `false` | Adds a free-form engine URL field at login. The proxy forwards to whatever is typed, so trusted/dev deployments only. (Distinct from `npm run dev`, which is the Vite dev server) |
 | `pluginDirs` | `WEBADMIN_PLUGIN_DIRS` | `[]` | Additional **local** plugin dirs scanned alongside the bundled `./plugins` (e.g. for local development). Extensions installed on the engine are served by the engine, not stored here. The env var uses the platform path-list delimiter (`:` on Unix, `;` on Windows) |
 | `trustedProxies` | `WEBADMIN_TRUSTED_PROXIES` | `[]` | Peer IPs trusted to set `X-Forwarded-For` (a front TLS terminator / reverse proxy). Loopback is always trusted. Comma-separated in the env var |
+| `frameAncestors` | `WEBADMIN_FRAME_ANCESTORS` | `[]` | Origins allowed to embed this UI in an iframe (`CSP frame-ancestors`). Empty → not embeddable (`'none'`). Comma-separated in the env var. Never `*`. Cross-site iframes also need HTTPS so the session cookie can be `SameSite=None` |
 | `codeTemplateCompletions` | `WEBADMIN_CODE_TEMPLATE_COMPLETIONS` | `true` | Offer the channel's own code-template functions as script-editor autocompletions; disable to avoid fetching very large catalogs |
 | `tls` | `WEBADMIN_TLS_KEY` / `WEBADMIN_TLS_CERT` / `WEBADMIN_TLS_PASSPHRASE` | `null` (HTTP) | Serve the UI over **HTTPS** directly — set `{ "key", "cert", "passphrase"? }` to PEM file paths (both key and cert required). Off by default; see [Serving over HTTPS](#serving-over-https) |
 
@@ -254,6 +295,23 @@ remembered selections once: each user re-picks their engine at the next sign-in.
 > `/api/users/_login` and the engine's `JSESSIONID` cookie carries the session.
 > The Node server stores no credentials; it is a streaming reverse proxy.
 
+### Embedding in another web client
+
+By default the UI refuses to load in an iframe (`Content-Security-Policy: frame-ancestors 'none'`). To let another origin embed it, list that origin:
+
+```json
+{
+    "frameAncestors": [
+        "https://portal.example.com",
+        "https://*.clients.example.com"
+    ]
+}
+```
+
+or `WEBADMIN_FRAME_ANCESTORS=https://portal.example.com,https://*.clients.example.com`. Each entry is `'self'`, an `http(s)` origin, or a host wildcard (`https://*.example.com`). `*` is rejected. The parent page then iframes the web administrator URL.
+
+Cross-site embedding needs HTTPS on this UI (built-in TLS or a terminator in front). The proxy then marks the engine session cookie `SameSite=None; Secure; Partitioned` so the iframe can stay signed in. Password sign-in works in the frame; OpenID Connect usually cannot — identity providers refuse to render in an iframe, so SSO still has to complete in a top-level window.
+
 ### Serving over HTTPS
 
 By default the app serves plain **HTTP** on `port` (the browser ↔ web-admin hop);
@@ -299,6 +357,7 @@ plugin UIs are disabled with a notice. Format Document runs entirely client-side
 | `EADDRINUSE` / port `3030` already in use | Set `WEBADMIN_PORT` (or `port` in `config.json`). |
 | Vite or syntax errors on `npm run dev` / `npm start` | Use Node 22 LTS (`node -v`); Node < 20.19 can't run Vite 8 and the test tooling. |
 | WAR URL returns 404 after copying | OIE discovers WARs only at startup. Put the file directly in `<OIE_HOME>/webapps/`, restart OIE, and use the context matching the WAR filename. |
+| Iframe is blank / `Refused to frame` in the console | The UI defaults to `frame-ancestors 'none'`. Set `frameAncestors` (or `WEBADMIN_FRAME_ANCESTORS`) to the parent origin. Cross-site embeds also need HTTPS. |
 | Message trees, Validate Script, or engine-served plugin UIs don't work | The connected engine has neither native web-support endpoints nor the [Web Support plugin](https://github.com/gibson9583/oie-web-support-plugin). Install the plugin and restart the engine. Format Document remains available because it is client-side. |
 
 ## Plugins & the Community Store
