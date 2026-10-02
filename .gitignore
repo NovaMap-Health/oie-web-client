@@ -148,3 +148,7 @@ vite.config.ts.timestamp-*
 /blob-report/
 /playwright/.cache/
 /release-artifacts/
+
+.worktrees/
+.superpowers/
+graphify-out/
