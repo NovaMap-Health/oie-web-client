@@ -19,7 +19,8 @@
 import type * as MonacoNs from 'monaco-editor';
 import { getState, subscribe } from './store.js';
 import { USER_API_DTS } from './userapi.generated.js';
-import { formatScript } from './serialize.js';
+import { formatScript, serializeTemplate } from './serialize.js';
+import { hl7Encoding, tokenizeHl7Line, hl7Tooltip, hl7FieldName, type Hl7Descriptions } from './content-highlight.js';
 import {
     getActiveCompletions, getActiveLibs, onActiveLibsChange, getActiveReferences, referenceSignature, dropTextFor, cleanDesc,
     setActiveScope, clearActiveScope, currentScope, activeScope, type TemplateLib
@@ -281,9 +282,67 @@ function pageLayoutService(monaco: Monaco) {
     };
 }
 
+class Hl7State implements MonacoNs.languages.IState {
+    constructor(readonly encoding = hl7Encoding('')) {}
+    clone(): Hl7State { return this; }
+    equals(other: MonacoNs.languages.IState): boolean { return other instanceof Hl7State && other.encoding === this.encoding; }
+}
+
+function hl7FieldAt(monaco: Monaco, model: MonacoNs.editor.ITextModel, position: MonacoNs.Position) {
+    let encoding = hl7Encoding('');
+    for (let n = position.lineNumber; n > 0; n--) {
+        const line = model.getLineContent(n);
+        if (/^(MSH|BHS|FHS)/.test(line) && line.length >= 8) { encoding = hl7Encoding(line); break; }
+    }
+    const line = model.getLineContent(position.lineNumber), tokens = tokenizeHl7Line(line, encoding);
+    const index = tokens.findIndex((token, i) => token.startIndex <= position.column - 1 && position.column - 1 < (tokens[i + 1]?.startIndex ?? line.length));
+    const field = tokens[index]?.field;
+    return field ? { field, range: new monaco.Range(position.lineNumber, tokens[index].startIndex + 1, position.lineNumber, (tokens[index + 1]?.startIndex ?? line.length) + 1) } : null;
+}
+
+function setupHl7(monaco: Monaco): void {
+    monaco.languages.register({ id: 'hl7v2' });
+    monaco.languages.setTokensProvider('hl7v2', {
+        getInitialState: () => new Hl7State(),
+        tokenize: (line, state: Hl7State) => {
+            const encoding = hl7Encoding(line, state.encoding);
+            return { tokens: tokenizeHl7Line(line, encoding), endState: new Hl7State(encoding) };
+        }
+    });
+    monaco.languages.registerHoverProvider('hl7v2', {
+        provideHover(model, position) {
+            const hit = hl7FieldAt(monaco, model, position);
+            return hit ? { range: hit.range, contents: [{ value: hl7Tooltip(hit.field) }] } : null;
+        }
+    });
+    // Enrich the immediate field path lazily, just as the browser uses the
+    // serializer's descriptions. Share one request per model revision; never
+    // serialize on keystrokes or show a response for text that has since changed.
+    const descriptions = new WeakMap<MonacoNs.editor.ITextModel, { version: number; result: Promise<Hl7Descriptions | null> }>();
+    monaco.languages.registerHoverProvider('hl7v2', {
+        async provideHover(model, position, token) {
+            const hit = hl7FieldAt(monaco, model, position);
+            if (!hit) return null;
+            const version = model.getVersionId();
+            let cached = descriptions.get(model);
+            if (cached?.version !== version) {
+                cached = { version, result: serializeTemplate('HL7V2', {}, model.getValue()).then(result => result?.meta?.descriptions || null) };
+                descriptions.set(model, cached);
+            }
+            const result = await cached.result;
+            if (!result && descriptions.get(model) === cached) descriptions.delete(model);
+            if (token.isCancellationRequested || model.isDisposed() || model.getVersionId() !== version) return null;
+            const name = hl7FieldName(hit.field, result);
+            // Engine vocabulary is plain text, never executable Markdown/HTML.
+            return name ? { range: hit.range, contents: [{ value: name.replace(/[\\`*_{}[\]()<>!#+\-.|~&]/g, '\\$&') }] } : null;
+        }
+    });
+}
+
 function setup(monaco: Monaco): void {
     // Standalone services start on first use; this editor supplies the override first.
     monaco.editor.create(document.createElement('div'), {}, { layoutService: pageLayoutService(monaco) } as any).dispose();
+    setupHl7(monaco);
     // Mirth scripts run in Rhino (E4X XML literals, Java interop) — Monaco's TS
     // parser would false-flag valid Rhino syntax, so disable its diagnostics and
     // let the engine's Rhino compile (core/serialize.js validateScript) be the
@@ -453,7 +512,9 @@ function setup(monaco: Monaco): void {
             { token: 'keyword', foreground: '6aa9e0' },
             { token: 'type', foreground: '4ec9b0' },
             { token: 'type.identifier', foreground: '4ec9b0' },
-            { token: 'delimiter', foreground: '9db2c4' }
+            { token: 'delimiter', foreground: '9db2c4' },
+            { token: 'hl7-seg', foreground: '6aa9e0', fontStyle: 'bold' },
+            { token: 'hl7-sep', foreground: '6a7a88' }
         ],
         colors: {
             'editor.background': '#0c1116',
@@ -475,7 +536,9 @@ function setup(monaco: Monaco): void {
             { token: 'keyword', foreground: '1c4fbb' },
             { token: 'type', foreground: '167c6d' },
             { token: 'type.identifier', foreground: '167c6d' },
-            { token: 'delimiter', foreground: '55677a' }
+            { token: 'delimiter', foreground: '55677a' },
+            { token: 'hl7-seg', foreground: '1c4fbb', fontStyle: 'bold' },
+            { token: 'hl7-sep', foreground: '5f7686' }
         ],
         colors: {
             'editor.background': '#ffffff',
@@ -492,7 +555,7 @@ function setup(monaco: Monaco): void {
 
 const LANGUAGES: Record<string, string> = {
     javascript: 'javascript', js: 'javascript', rhino: 'javascript',
-    xml: 'xml', html: 'html', json: 'json', sql: 'sql', text: 'plaintext'
+    xml: 'xml', html: 'html', json: 'json', sql: 'sql', hl7v2: 'hl7v2', text: 'plaintext'
 };
 
 /* Monaco editors hold a model, listeners, layout observer and a debounce timer
@@ -553,6 +616,10 @@ function hookRouteSweep(): void {
 export function mountMonaco(monaco: Monaco, editor: UpgradeableEditor, opts: MonacoMountOptions = {}): void {
     if (!editor.el || !editor.el.classList || editor.monaco) return;
     const value = editor.getValue();
+    // Only hand off the active literal textarea; other editors must not steal focus.
+    const area = opts.literalInput ? editor.el.querySelector('textarea') : null;
+    const selection = area && document.activeElement === area
+        ? { start: area.selectionStart, end: area.selectionEnd, backward: area.selectionDirection === 'backward' } : null;
 
     const host = document.createElement('div');
     host.className = 'monaco-host';
@@ -565,10 +632,12 @@ export function mountMonaco(monaco: Monaco, editor: UpgradeableEditor, opts: Mon
     for (const b of zoomBtns) editor.el.appendChild(b);
 
     const lang = LANGUAGES[opts.language || 'javascript'] || 'plaintext';
+    if (lang === 'hl7v2') host.classList.add('hl7-editor');
     const instance = monaco.editor.create(host, {
         value,
         language: lang,
         readOnly: !!opts.readOnly,
+        ariaLabel: opts.ariaLabel,
         automaticLayout: true,
         minimap: { enabled: false },
         scrollBeyondLastLine: false,
@@ -589,12 +658,40 @@ export function mountMonaco(monaco: Monaco, editor: UpgradeableEditor, opts: Mon
         // Turn it off for JS; keep it for SQL/XML/plaintext, where it's the main
         // completion source.
         wordBasedSuggestions: lang === 'javascript' ? 'off' : 'currentDocument',
+        ...(opts.literalInput ? {
+            lineNumbersMinChars: 2, lineDecorationsWidth: 4, folding: lang !== 'plaintext' && lang !== 'hl7v2',
+            insertSpaces: false, useTabStops: false, detectIndentation: false, autoIndent: 'none' as const,
+            trimAutoWhitespace: false,
+            // Native EditContext can bypass the cancellable beforeinput below.
+            editContext: false,
+            autoClosingBrackets: 'never' as const, autoClosingQuotes: 'never' as const,
+            autoSurround: 'never' as const, quickSuggestions: false,
+            wordBasedSuggestions: 'off' as const, suggestOnTriggerCharacters: false,
+            formatOnPaste: false, formatOnType: false
+        } : {}),
         // Monaco's native drop-into-editor inserts dropped text as a *snippet*
         // (escaping ${...} to \${...\} and appending a $0 tab stop). We insert
         // velocity/accessor tokens as plain text ourselves, so disable it.
         dropIntoEditor: { enabled: false },
         scrollbar: { verticalScrollbarSize: 10, horizontalScrollbarSize: 10 }
     });
+
+    // Monaco's Tab and electric closing brackets can rewrite whitespace even
+    // with autoIndent disabled. Its plain typing command handles selections,
+    // multiple cursors and undo without applying those indentation heuristics.
+    const literalTab = opts.literalInput ? instance.addAction({
+        id: 'oie.literalTab', label: 'Insert Tab', keybindings: [monaco.KeyCode.Tab],
+        precondition: 'editorTextFocus && !editorReadonly && !editorTabMovesFocus',
+        run: editor => editor.trigger('literal-input', 'type', { text: '\t' })
+    }) : null;
+    const literalBracket = (event: InputEvent) => {
+        if (!event.cancelable || event.isComposing || event.inputType !== 'insertText'
+            || !/[\]})>]/.test(event.data || '') || !instance.hasTextFocus()
+            || instance.getOption(monaco.editor.EditorOption.readOnly)) return;
+        event.preventDefault();
+        instance.trigger('literal-input', 'type', { text: event.data });
+    };
+    if (opts.literalInput) host.addEventListener('beforeinput', literalBracket, true);
 
     // Re-highlight only the lines an edit touched (debounced), not the whole doc.
     let hlTimer: ReturnType<typeof setTimeout> | null = null, hlFrom = Infinity, hlTo = 0;
@@ -666,6 +763,8 @@ export function mountMonaco(monaco: Monaco, editor: UpgradeableEditor, opts: Mon
         if (editor.__maxCleanup) editor.__maxCleanup();
         if (hlTimer) clearTimeout(hlTimer);
         changeSub.dispose();
+        literalTab?.dispose();
+        if (opts.literalInput) host.removeEventListener('beforeinput', literalBracket, true);
         if (tokenSub) tokenSub.dispose();
         if (focusSub) { focusSub.dispose(); releaseScope(holder); }
         const model = instance.getModel();
@@ -681,4 +780,12 @@ export function mountMonaco(monaco: Monaco, editor: UpgradeableEditor, opts: Mon
     editor.setValue = (v: string | null | undefined) => instance.setValue(v ?? '');
     editor.focus = () => instance.focus();
     editor.dispose = record.dispose;
+    if (selection && editor.el.isConnected
+        && (document.activeElement === document.body || editor.el.contains(document.activeElement))) {
+        const model = instance.getModel()!;
+        const anchor = model.getPositionAt(selection.backward ? selection.end : selection.start);
+        const active = model.getPositionAt(selection.backward ? selection.start : selection.end);
+        instance.setSelection(new monaco.Selection(anchor.lineNumber, anchor.column, active.lineNumber, active.column));
+        instance.focus();
+    }
 }

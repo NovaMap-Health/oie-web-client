@@ -15,12 +15,14 @@ export class CodeEditor {
     monaco;
     __maxCleanup;
     _lines;
+    _tabFocus;
     constructor(opts = {}) {
         this.opts = opts;
         this.gutter = h('div.ce-gutter', '1');
         this.area = h('textarea.ce-area', {
             spellcheck: 'false',
             readOnly: !!opts.readOnly,
+            'aria-label': opts.ariaLabel,
             placeholder: opts.placeholder || ''
         });
         this.area.value = opts.value ?? '';
@@ -36,29 +38,56 @@ export class CodeEditor {
         this.syncGutter();
     }
     handleKey(e) {
-        if (e.key === 'Tab' && !this.opts.readOnly) {
+        if (this.opts.literalInput && e.ctrlKey && !e.altKey && !e.metaKey && e.key.toLowerCase() === 'm') {
             e.preventDefault();
-            const { selectionStart: start, selectionEnd: end, value } = this.area;
+            this._tabFocus = !this._tabFocus;
+        }
+        else if (e.key === 'Tab' && !this.opts.readOnly && !this._tabFocus) {
+            e.preventDefault();
+            const { selectionStart: start, selectionEnd: end, selectionDirection: direction, value } = this.area;
+            let from = start, to = end, text = '\t', caret = start + 1;
             if (e.shiftKey) {
                 // Outdent the current line.
-                const lineStart = value.lastIndexOf('\n', start - 1) + 1;
-                if (value.startsWith('\t', lineStart)) {
-                    this.area.value = value.slice(0, lineStart) + value.slice(lineStart + 1);
-                    this.area.selectionStart = this.area.selectionEnd = Math.max(lineStart, start - 1);
+                const lineStart = start === 0 ? 0 : value.lastIndexOf('\n', start - 1) + 1;
+                const indent = value.startsWith('\t', lineStart) ? 1 : value.startsWith('    ', lineStart) ? 4 : 0;
+                if (!indent)
+                    return;
+                from = lineStart;
+                to = lineStart + indent;
+                text = '';
+                caret = Math.max(lineStart, start - indent);
+            }
+            if (value.slice(from, to) === text) {
+                this.area.setSelectionRange(caret, caret);
+                return;
+            }
+            let notified = false;
+            if (this.opts.literalInput) {
+                // Native commands preserve undo; assigning .value does not.
+                const doc = this.area.ownerDocument;
+                if (doc.activeElement !== this.area)
+                    return;
+                const onInput = () => { notified = true; };
+                this.area.addEventListener('input', onInput);
+                this.area.setSelectionRange(from, to);
+                try {
+                    doc.execCommand(text ? 'insertText' : 'delete', false, text);
                 }
-                else if (value.startsWith('    ', lineStart)) {
-                    this.area.value = value.slice(0, lineStart) + value.slice(lineStart + 4);
-                    this.area.selectionStart = this.area.selectionEnd = Math.max(lineStart, start - 4);
+                catch { /* Unsupported commands leave the text/history intact. */ }
+                finally {
+                    this.area.removeEventListener('input', onInput);
                 }
             }
             else {
-                this.area.value = value.slice(0, start) + '\t' + value.slice(end);
-                this.area.selectionStart = this.area.selectionEnd = start + 1;
+                this.area.value = value.slice(0, from) + text + value.slice(to);
             }
-            this.syncGutter();
-            this.opts.onChange && this.opts.onChange(this.getValue());
+            const changed = this.area.value !== value;
+            this.area.setSelectionRange(changed ? caret : start, changed ? caret : end, direction);
+            // Some engines omit input for execCommand; never notify twice.
+            if (changed && !notified)
+                this.area.dispatchEvent(new Event('input', { bubbles: true }));
         }
-        else if (e.key === 'Enter' && !this.opts.readOnly) {
+        else if (e.key === 'Enter' && !this.opts.readOnly && !this.opts.literalInput) {
             // Keep the indentation of the previous line.
             const { selectionStart: start, value } = this.area;
             const lineStart = value.lastIndexOf('\n', start - 1) + 1;
@@ -284,8 +313,14 @@ let factory = (opts = {}) => {
     const editor = new CodeEditor(opts);
     if (opts.maximizable || opts.popoutable)
         attachCodeView(editor, opts);
+    let disposed = false, edited = false;
+    // Keep native undo history and explicit Tab navigation choices until remount.
+    if (opts.literalInput)
+        editor.area.addEventListener('input', () => { edited = true; }, { once: true });
+    const dispose = editor.dispose.bind(editor);
+    editor.dispose = () => { disposed = true; dispose(); };
     ensureMonaco().then((monaco) => {
-        if (!monaco)
+        if (!monaco || disposed || edited || (opts.literalInput && editor._tabFocus !== undefined))
             return;
         try {
             mountMonaco(monaco, editor, opts);
