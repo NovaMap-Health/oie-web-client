@@ -46,6 +46,7 @@ import * as router from '../../core/router.js';
 import { routeUrl } from '../../core/deployment.js';
 import { registerUnsavedCheck } from '../../core/unsaved.js';
 import { validateScript } from '../../core/serialize.js';
+import { channelResponseVariables, loadCustomResponseVariables } from '../../core/channel-response.js';
 import { setActiveScope, clearActiveScope } from '../../core/script-completions.js';
 import { getPref } from '../../core/prefs.js';
 import { dataTypeDef, dataTypeList, normalizeDataTypeProperties } from '../../datatypes/index.js';
@@ -1843,6 +1844,22 @@ function RawConnectorProps({ connector, markDirty }: any) {
 function SourceSettings({ channel, scp, markDirty }: any) {
     const [, bump] = useReducer((x: any) => x + 1, 0);
     const respondAfter = scp.respondAfterProcessing !== false;   // queue OFF when true
+    const { variables, customRequest } = respondAfter
+        ? channelResponseVariables(channel) : { variables: [], customRequest: '' };
+    const [attempt, retry] = useReducer((value: number) => value + 1, 0);
+    const [result, setResult] = useState<{ request: string; attempt: number; variables: string[]; error?: string } | null>(null);
+    useEffect(() => {
+        if (!customRequest) return;
+        const isCurrent = channelSessionActive();
+        let active = true;
+        loadCustomResponseVariables(customRequest).then(
+            variables => { if (active && isCurrent()) setResult({ request: customRequest, attempt, variables }); },
+            error => { if (active && isCurrent()) setResult({ request: customRequest, attempt, variables: [], error: error.message }); }
+        );
+        return () => { active = false; };
+    }, [customRequest, attempt]);
+    // Never render a previous connector's options while its replacement is loading.
+    const custom = result?.request === customRequest && result.attempt === attempt ? result : null;
 
     // Response: static auto-generate options (fewer when queued), plus
     // "respond from" each destination (stored as the "d<id>" response key).
@@ -1853,8 +1870,11 @@ function SourceSettings({ channel, scp, markDirty }: any) {
         for (const d of oie.destinationsOf(channel)) {
             respOpts.push({ value: 'd' + d.metaDataId, label: d.name || `Destination ${d.metaDataId}` });
         }
+        for (const v of [...variables, ...(custom?.variables || [])]) {
+            if (!respOpts.some(o => o.value === v)) respOpts.push({ value: v, label: v });
+        }
     }
-    const currentResp = scp.responseVariable ?? 'None';
+    const currentResp = String(scp.responseVariable ?? 'None');
     if (!respOpts.some(o => o.value === currentResp)) respOpts.push({ value: currentResp, label: currentResp });
 
     return (
@@ -1891,6 +1911,11 @@ function SourceSettings({ channel, scp, markDirty }: any) {
                     onChange={(e: any) => { scp.responseVariable = e.target.value; markDirty(); bump(); }}>
                     {respOpts.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
                 </select>
+                {customRequest && !custom && <div className="hint" role="status">Loading custom response variables…</div>}
+                {customRequest && custom?.error && <div className="hint" role="status">
+                    Custom response variables could not be loaded. {custom.error}{' '}
+                    <button type="button" className="btn" onClick={() => retry()}>Retry</button>
+                </div>}
             </div>
             <div className="field">
                 <label>Process Batch</label>

@@ -1,0 +1,58 @@
+/* Literal response-map writes, including escaped quotes and trailing backslashes. */
+const RESPONSE_PUT_RE = /(?:responseMap\s*\.\s*put|\$r)\s*\(\s*(['"])((?:\\(?:\r\n|[\s\S])|(?!\1)[^\\\r\n\u2028\u2029])*)\1(?=(?:\s|\/\*(?:[^*]|\*(?!\/))*\*\/|\/\/[^\r\n\u2028\u2029]*(?=[\r\n\u2028\u2029]|$))*,)/g;
+const ESCAPES: Record<string, string> = { b: '\b', f: '\f', n: '\n', r: '\r', t: '\t', v: '\v' };
+
+// Rhino skips BMP format characters (except BOM) only while reading escapes,
+// including hex/octal lookahead and the character after a line continuation.
+function normalizeEscapeFormats(script: string): string {
+    if (!/\p{Cf}/u.test(script)) return script;
+    let normalized = '';
+    for (let i = 0; i < script.length; i++) {
+        normalized += script[i];
+        if (script[i] !== '\\') continue;
+        const skipFormats = () => {
+            while (script[i + 1] !== '\ufeff' && /\p{Cf}/u.test(script[i + 1] ?? '')) i++;
+        };
+        skipFormats();
+        const escape = script[++i];
+        if (escape === undefined) break;
+        normalized += escape;
+        if (escape === 'u' || escape === 'x') {
+            for (let digit = 0; digit < (escape === 'u' ? 4 : 2); digit++) {
+                skipFormats();
+                if (!/[\da-fA-F]/.test(script[i + 1] ?? '')) break;
+                normalized += script[++i];
+            }
+        } else if (/[0-7]/.test(escape)) {
+            for (let digit = 1; digit < (escape <= '3' ? 3 : 2); digit++) {
+                skipFormats();
+                if (!/[0-7]/.test(script[i + 1] ?? '')) break;
+                normalized += script[++i];
+            }
+            skipFormats();
+        } else if (/[\r\n\u2028\u2029]/.test(escape)) {
+            if (escape === '\r' && script[i + 1] === '\n') normalized += script[++i];
+            skipFormats();
+        }
+    }
+    return normalized;
+}
+
+// Match Rhino 1.7.13 without evaluating scripts: unsupported u/x escapes lose
+// only the backslash, including brace-form Unicode and incomplete hex escapes.
+function decodeKey(key: string): string {
+    return key.replace(/\\(u[\da-fA-F]{4}|x[\da-fA-F]{2}|[0-3][0-7]{0,2}|[4-7][0-7]?|\r\n|[\s\S])/g, (_, escape: string) => {
+        if (escape.length > 1 && (escape[0] === 'u' || escape[0] === 'x')) return String.fromCharCode(parseInt(escape.slice(1), 16));
+        if (/^[0-7]/.test(escape)) return String.fromCharCode(parseInt(escape, 8));
+        return /^[\r\n\u2028\u2029]/.test(escape) ? '' : ESCAPES[escape] ?? escape;
+    });
+}
+
+export function responseVariablesIn(script: unknown): string[] {
+    if (typeof script !== 'string') return [];
+    const variables = new Set<string>();
+    for (const match of normalizeEscapeFormats(script).matchAll(RESPONSE_PUT_RE)) {
+        variables.add(decodeKey(match[2]));
+    }
+    return [...variables];
+}

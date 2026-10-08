@@ -1,4 +1,5 @@
 import { test, expect } from './base.js';
+import type { Page } from '@playwright/test';
 import { mockEngine } from './mock.js';
 import { CASES as CONNECTOR_CASES, makeChannel } from './connector-fixtures.js';
 
@@ -164,6 +165,27 @@ const CHANNEL_FIXTURES = {
     [`PUT /channels/${CHANNEL_ID}`]: true,
     'POST /channels': true,
 };
+
+const CUSTOM_RESPONSE_RULE = 'com.example.responses.CustomRule';
+const CUSTOM_RESPONSE_STEP = 'com.example.responses.CustomStep';
+const responseSelect = (page: Page) => page.locator('.field:has(> label:text-is("Response")) select');
+const customResponseFixtures = (handler: any) => ({
+    'POST /extensions/websupport/elements/_responseVariables': handler,
+    'POST /elements/_responseVariables': handler,
+});
+function customResponseChannel() {
+    const channel = structuredClone(FULL_CHANNEL);
+    channel.sourceConnector.filter.elements = {
+        [CUSTOM_RESPONSE_RULE]: {
+            '@version': '4.6.0', name: 'Custom response', sequenceNumber: '0', enabled: true,
+            responseKey: 'customAck',
+        },
+    };
+    return channel;
+}
+async function settleResponseRendering(page: Page) {
+    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+}
 
 test.describe('Channel editor', () => {
     test.beforeEach(async ({ page }) => {
@@ -670,5 +692,349 @@ test.describe('Channel editor', () => {
         await expect(page).toHaveURL(new RegExp(`/channels/${CHANNEL_ID}/response/1$`));
         expect(page.url()).not.toContain('#');
     });
+
+    test('Source Response lists the response variables the channel puts (issue #99)', async ({ page }) => {
+        const channel = structuredClone(FULL_CHANNEL);
+        channel.sourceConnector.transformer.elements = {
+            'com.mirth.connect.plugins.mapper.MapperStep': {
+                '@version': '4.6.0', name: 'Map Response', sequenceNumber: '0', enabled: true,
+                variable: 'sourceMapped', mapping: "'x'", defaultValue: '', replacements: '', scope: 'RESPONSE',
+            },
+            'com.mirth.connect.plugins.javascriptstep.JavaScriptStep': {
+                '@version': '4.6.0', name: 'Disabled Step', sequenceNumber: '1', enabled: false,
+                script: "responseMap.put('disabledSource', 'x');",
+            },
+        };
+        const dest = channel.destinationConnectors.connector[0];
+        dest.responseTransformer.elements = {
+            'com.mirth.connect.plugins.javascriptstep.JavaScriptStep': {
+                '@version': '4.6.0', name: 'Put ACK', sequenceNumber: '0', enabled: true,
+                script: "responseMap.put('destAck', response);\n$r('getOnly');",
+            },
+        };
+        channel.postprocessingScript = "$r('postVar', 'x');\nreturn;";
+        await mockEngine(page, { ...CHANNEL_FIXTURES, [`GET /channels/${CHANNEL_ID}`]: { channel } });
+
+        await page.goto(`/channels/${CHANNEL_ID}/edit`);
+        await page.getByRole('tab', { name: 'Source', exact: true }).click();
+
+        const response = page.locator('.field:has(> label:text-is("Response")) select');
+        await expect(response.locator('option')).toHaveText([
+            'None', 'Auto-generate (Before processing)', 'Auto-generate (After source transformer)',
+            'Auto-generate (Destinations completed)', 'Postprocessor', 'Send To Downstream',
+            'sourceMapped', 'destAck', 'postVar',
+        ]);
+        await response.selectOption('destAck');
+        await expect(response).toHaveValue('destAck');
+    });
+
+    test('Source Response preserves escaped JavaScript keys through selection, save and reload', async ({ page }) => {
+        let channel = structuredClone(FULL_CHANNEL);
+        channel.postprocessingScript = [
+            String.raw`responseMap.put('r\u0065ply' /* ACK key */, 'x');`,
+            String.raw`responseMap.put('line\nbreak', 'x');`,
+            String.raw`$r('trail\\', 'x');`,
+        ].join('\n');
+        const savedKeys: string[] = [];
+        await mockEngine(page, {
+            ...CHANNEL_FIXTURES,
+            [`GET /channels/${CHANNEL_ID}`]: () => ({ channel }),
+            [`PUT /channels/${CHANNEL_ID}`]: (request: any) => {
+                channel = request.postDataJSON().channel;
+                savedKeys.push(channel.sourceConnector.properties.sourceConnectorProperties.responseVariable);
+                return true;
+            },
+        });
+        await page.goto(`/channels/${CHANNEL_ID}/edit`);
+        await page.getByRole('tab', { name: 'Source', exact: true }).click();
+        for (const key of ['reply', 'line\nbreak', 'trail\\']) {
+            await responseSelect(page).selectOption(key);
+            await expect(responseSelect(page)).toHaveValue(key);
+            await page.getByRole('button', { name: 'Save Changes', exact: true }).click();
+            await expect.poll(() => savedKeys.at(-1)).toBe(key);
+            await expect(page.locator('.toast-msg', { hasText: 'Saved Round Trip Channel' })).toBeVisible();
+            await page.reload();
+            await page.getByRole('tab', { name: 'Source', exact: true }).click();
+            await expect(responseSelect(page)).toHaveValue(key);
+        }
+        expect(savedKeys).toEqual(['reply', 'line\nbreak', 'trail\\']);
+    });
+
+    test('Source Response restores exact engine-coerced keys before unrelated saves', async ({ page }) => {
+        let channel = structuredClone(FULL_CHANNEL);
+        // Actual ObjectJSONSerializer outputs observed for these Java String keys.
+        const keys = ['1.0', 'null', '', '-0', '1e3', '9007199254740993'];
+        const wireValues = [1, null, null, 0, 1000, 9007199254740992];
+        channel.postprocessingScript = keys.map(key => `$r(${JSON.stringify(key)}, 'ACK');`).join('\n');
+        const saved: string[] = [];
+        let xmlReads = 0;
+        await mockEngine(page, {
+            ...CHANNEL_FIXTURES,
+            [`GET /channels/${CHANNEL_ID}`]: (request: any) => {
+                const key = channel.sourceConnector.properties.sourceConnectorProperties.responseVariable;
+                if (request.headers().accept === 'application/xml') {
+                    xmlReads++;
+                    return `<channel><id>${CHANNEL_ID}</id><revision>${channel.revision}</revision>
+                        <sourceConnector><properties><sourceConnectorProperties><responseVariable>${key}</responseVariable></sourceConnectorProperties></properties></sourceConnector>
+                        <exportData><metadata><lastModified><time>${channel.exportData.metadata.lastModified.time}</time></lastModified></metadata></exportData></channel>`;
+                }
+                const wire = structuredClone(channel);
+                const index = keys.indexOf(key);
+                if (index >= 0) wire.sourceConnector.properties.sourceConnectorProperties.responseVariable = wireValues[index];
+                return { channel: wire };
+            },
+            [`PUT /channels/${CHANNEL_ID}`]: (request: any) => {
+                channel = request.postDataJSON().channel;
+                saved.push(channel.sourceConnector.properties.sourceConnectorProperties.responseVariable);
+                return true;
+            },
+        });
+        await page.goto(`/channels/${CHANNEL_ID}/edit`);
+        await page.getByRole('tab', { name: 'Source', exact: true }).click();
+        for (const [index, key] of keys.entries()) {
+            await responseSelect(page).selectOption(key);
+            await page.getByRole('button', { name: 'Save Changes', exact: true }).click();
+            await expect.poll(() => saved.length).toBe(index * 2 + 1);
+            await expect(page.locator('.toast-msg', { hasText: 'Saved Round Trip Channel' }).last()).toBeVisible();
+            await page.reload();
+            await page.getByRole('tab', { name: 'Source', exact: true }).click();
+            await expect(responseSelect(page)).toHaveValue(key);
+            await page.locator('.field:has(> label:text-is("Max Processing Threads")) input').fill(String(index + 2));
+            await page.getByRole('button', { name: 'Save Changes', exact: true }).click();
+            await expect.poll(() => saved.length).toBe(index * 2 + 2);
+            expect(saved.slice(-2)).toEqual([key, key]);
+            await expect(page.locator('.toast-msg', { hasText: 'Saved Round Trip Channel' }).last()).toBeVisible();
+        }
+        expect(xmlReads).toBeGreaterThanOrEqual(keys.length);
+    });
+
+    test('Source Response exact-name reads preserve list clones and reject stale or failed XML', async ({ page }) => {
+        const channel = structuredClone(FULL_CHANNEL);
+        channel.sourceConnector.properties.sourceConnectorProperties.responseVariable = 1;
+        const mapper = 'com.mirth.connect.plugins.mapper.MapperStep';
+        channel.sourceConnector.transformer.elements = { [mapper]: [
+            { scope: 'RESPONSE', variable: 1000, sequenceNumber: 0 },
+            { scope: 'RESPONSE', variable: null, sequenceNumber: 1 },
+        ] };
+        let mode = 'success', xmlReads = 0;
+        let release = () => {};
+        let pending: Promise<void> | undefined;
+        const writes: any[] = [];
+        await mockEngine(page, {
+            ...CHANNEL_FIXTURES, 'GET /channels': { list: { channel } },
+            [`GET /channels/${CHANNEL_ID}`]: async (request: any) => {
+                if (request.headers().accept !== 'application/xml') return { channel };
+                xmlReads++;
+                if (pending) await pending;
+                if (mode === 'failure') return { __status: 503, body: 'XML unavailable' };
+                return `<channel><id>${mode === 'id' ? 'different' : CHANNEL_ID}</id><revision>${mode === 'revision' ? 4 : 3}</revision>
+                    <sourceConnector><properties><sourceConnectorProperties>${mode === 'missing' ? '' : '<responseVariable>1.0</responseVariable>'}</sourceConnectorProperties></properties>
+                    <transformer><elements><${mapper}><variable>1e3</variable></${mapper}><${mapper}><variable>null</variable></${mapper}></elements></transformer></sourceConnector>
+                    <exportData><metadata><lastModified><time>${mode === 'timestamp' ? 2 : channel.exportData.metadata.lastModified.time}</time></lastModified></metadata></exportData></channel>`;
+            },
+            'POST /channels': (request: any) => { writes.push(request.postDataJSON().channel); return true; },
+        });
+        await page.goto(`/channels/${CHANNEL_ID}/edit`);
+        await expect(page.getByRole('tab', { name: 'Source', exact: true })).toBeVisible();
+        const cloned = await page.evaluate(async () => {
+            const api = await import(String('/core/api.js'));
+            const [channel] = await api.channels.list();
+            await api.channels.create({ ...channel, id: 'cloned' });
+            return channel;
+        });
+        expect(cloned.sourceConnector.properties.sourceConnectorProperties.responseVariable).toBe('1.0');
+        expect(writes[0].sourceConnector.transformer.elements[mapper].map((step: any) => step.variable)).toEqual(['1e3', 'null']);
+        for (mode of ['id', 'revision', 'timestamp', 'missing', 'failure']) {
+            const error = await page.evaluate(async id => {
+                try { await (await import(String('/core/api.js'))).channels.get(id); return ''; }
+                catch (error: any) { return error.message; }
+            }, CHANNEL_ID);
+            expect(error).toMatch(mode === 'missing' ? /invalid response name XML/ : mode === 'failure' ? /XML unavailable/ : /Channel changed/);
+        }
+        mode = 'success';
+        pending = new Promise<void>(resolve => { release = resolve; });
+        const before = xmlReads;
+        const read = page.evaluate(async id => {
+            try { await (await import(String('/core/api.js'))).channels.get(id); return ''; }
+            catch (error: any) { return error.message; }
+        }, CHANNEL_ID);
+        try {
+            await expect.poll(() => xmlReads).toBeGreaterThan(before);
+            await page.evaluate(async () => (await import(String('/core/engine-fetch.js'))).discardEngineResponses());
+        } finally { release(); }
+        expect(await read).toMatch(/previous session/);
+    });
+
+    test('Source Response discovers custom server elements from unsaved edits and deduplicates keys', async ({ page }) => {
+        let channel = customResponseChannel();
+        const sourceRule = channel.sourceConnector.filter.elements[CUSTOM_RESPONSE_RULE];
+        channel.sourceConnector.filter.elements[CUSTOM_RESPONSE_RULE] = [
+            sourceRule,
+            { ...sourceRule, name: 'Disabled boolean', sequenceNumber: '1', enabled: false, responseKey: 'disabledBoolean' },
+            { ...sourceRule, name: 'Disabled string', sequenceNumber: '2', enabled: 'false', responseKey: 'disabledString' },
+        ];
+        const destination = channel.destinationConnectors.connector[0];
+        destination.enabled = false;
+        // Keep the channel saveable while verifying discovery from a disabled destination.
+        channel.destinationConnectors.connector.push({
+            ...structuredClone(FULL_CHANNEL.destinationConnectors.connector[0]), metaDataId: 2, name: 'Enabled sink',
+        });
+        channel.nextMetaDataId = 3;
+        destination.transformer.elements = {
+            [CUSTOM_RESPONSE_STEP]: { ...sourceRule, enabled: false, responseKey: 'destAck' },
+        };
+        destination.responseTransformer.elements = {
+            [CUSTOM_RESPONSE_STEP]: { ...sourceRule, enabled: 'false', responseKey: 'responseAck' },
+        };
+        channel.postprocessingScript = "responseMap.put('localAck', 'x');";
+        const requests: any[] = [];
+        const writes: any[] = [];
+        await mockEngine(page, {
+            ...CHANNEL_FIXTURES,
+            [`GET /channels/${CHANNEL_ID}`]: () => ({ channel }),
+            [`PUT /channels/${CHANNEL_ID}`]: (request: any) => {
+                channel = request.postDataJSON().channel;
+                writes.push(channel);
+                return true;
+            },
+            ...customResponseFixtures((request: any) => {
+                const body = request.postDataJSON();
+                requests.push(body);
+                const elements: any[] = Object.values(body.list).flat();
+                return { responseVariables: [...elements.map(element => element.responseKey), 'localAck', 'd1', 'None', 'destAck'] };
+            }),
+        });
+        // A custom plugin without a web editor can still be edited through the raw fallback.
+        await page.goto(`/channels/${CHANNEL_ID}/filter/0`);
+        const raw = page.locator('.field:has(> label:text-is("Raw element (JSON)")) textarea');
+        await expect(raw).toBeVisible();
+        await raw.fill(JSON.stringify({ ...sourceRule, responseKey: 'unsavedRuleAck' }));
+        await raw.blur();
+        await page.getByRole('button', { name: 'Back to Channel', exact: true }).click();
+        await page.getByRole('tab', { name: 'Source', exact: true }).click();
+        await expect.poll(async () => responseSelect(page).locator('option').evaluateAll(options => options.map(option => (option as HTMLOptionElement).value)))
+            .toEqual(expect.arrayContaining(['unsavedRuleAck', 'destAck', 'responseAck', 'localAck']));
+        expect(requests).toHaveLength(1);
+        expect(Object.keys(requests[0].list).sort()).toEqual([CUSTOM_RESPONSE_RULE, CUSTOM_RESPONSE_STEP].sort());
+        const sent: any[] = Object.values(requests[0].list).flat();
+        expect(sent.map(element => element.responseKey).sort()).toEqual(['unsavedRuleAck', 'destAck', 'responseAck'].sort());
+        expect(sent.every(element => !('__type' in element) && element['@version'] === '4.6.0')).toBe(true);
+        const options = await responseSelect(page).locator('option').evaluateAll(items => items.map(item => (item as HTMLOptionElement).value));
+        expect(new Set(options).size).toBe(options.length);
+        expect(options).not.toContain('disabledBoolean');
+        expect(options).not.toContain('disabledString');
+        await responseSelect(page).selectOption('unsavedRuleAck');
+        await expect(responseSelect(page)).toHaveValue('unsavedRuleAck');
+        await page.getByRole('button', { name: 'Save Changes', exact: true }).click();
+        await expect.poll(() => writes.length).toBe(1);
+        expect(writes[0].sourceConnector.properties.sourceConnectorProperties.responseVariable).toBe('unsavedRuleAck');
+        await expect(page.locator('.toast-msg', { hasText: 'Saved Round Trip Channel' })).toBeVisible();
+        await page.reload();
+        await page.getByRole('tab', { name: 'Source', exact: true }).click();
+        await expect.poll(() => requests.length).toBe(2);
+        await expect(responseSelect(page).locator('option[value="responseAck"]')).toHaveCount(1);
+        await expect(responseSelect(page)).toHaveValue('unsavedRuleAck');
+        expect(Object.values(requests[1].list).flat().map((element: any) => element.responseKey))
+            .toContain('unsavedRuleAck');
+    });
+
+    test('Source Response keeps local choices available after a custom lookup failure and retries', async ({ page }) => {
+        const channel = customResponseChannel();
+        channel.postprocessingScript = "responseMap.put('localAck', 'x');";
+        let attempts = 0;
+        await mockEngine(page, {
+            ...CHANNEL_FIXTURES,
+            [`GET /channels/${CHANNEL_ID}`]: { channel },
+            ...customResponseFixtures(() => ++attempts === 1
+                ? { __status: 503, body: { error: 'Response discovery unavailable' } }
+                : { responseVariables: ['customAck'] }),
+        });
+        await page.goto(`/channels/${CHANNEL_ID}/edit`);
+        await page.getByRole('tab', { name: 'Source', exact: true }).click();
+        const error = page.getByRole('status').filter({ hasText: 'Custom response variables could not be loaded.' });
+        await expect(error).toBeVisible();
+        await responseSelect(page).selectOption('localAck');
+        await expect(responseSelect(page)).toHaveValue('localAck');
+        await page.getByRole('button', { name: 'Retry', exact: true }).click();
+        await expect(responseSelect(page).locator('option[value="customAck"]')).toHaveCount(1);
+        await expect(error).toHaveCount(0);
+        await expect(responseSelect(page)).toHaveValue('localAck');
+        expect(attempts).toBe(2);
+    });
+
+    test('Source Queue ON excludes delayed custom responses and clamps a selected key', async ({ page }) => {
+        const channel = customResponseChannel();
+        channel.sourceConnector.properties.sourceConnectorProperties.responseVariable = 'customAck';
+        let release = () => {};
+        const pending = new Promise<void>(resolve => { release = resolve; });
+        let requested = false;
+        await mockEngine(page, {
+            ...CHANNEL_FIXTURES,
+            [`GET /channels/${CHANNEL_ID}`]: { channel },
+            ...customResponseFixtures(async () => {
+                requested = true;
+                await pending;
+                return { responseVariables: ['delayedAck'] };
+            }),
+        });
+        try {
+            await page.goto(`/channels/${CHANNEL_ID}/edit`);
+            await page.getByRole('tab', { name: 'Source', exact: true }).click();
+            await expect.poll(() => requested).toBe(true);
+            await expect(responseSelect(page)).toHaveValue('customAck');
+            await page.locator('.field:has(> label:text-is("Source Queue")) select').selectOption('on');
+            const completed = page.waitForResponse(response => response.url().endsWith('/elements/_responseVariables'));
+            release();
+            await (await completed).finished();
+            await settleResponseRendering(page);
+            await expect(responseSelect(page).locator('option')).toHaveText(['None', 'Auto-generate (Before processing)']);
+            await expect(responseSelect(page)).toHaveValue('None');
+        } finally { release(); }
+    });
+
+    for (const interruption of ['tab remount', 'source import', 'session'] as const) {
+        test(`Source Response ignores an old lookup after ${interruption}`, async ({ page }) => {
+            const channel = customResponseChannel();
+            let release = () => {};
+            const pending = new Promise<void>(resolve => { release = resolve; });
+            let requests = 0;
+            await mockEngine(page, {
+                ...CHANNEL_FIXTURES,
+                [`GET /channels/${CHANNEL_ID}`]: { channel },
+                ...customResponseFixtures(async () => {
+                    if (++requests === 1) { await pending; return { responseVariables: ['oldAck'] }; }
+                    return { responseVariables: ['newAck'] };
+                }),
+            });
+            try {
+                await page.goto(`/channels/${CHANNEL_ID}/edit`);
+                await page.getByRole('tab', { name: 'Source', exact: true }).click();
+                await expect.poll(() => requests).toBe(1);
+                if (interruption === 'tab remount') {
+                    await page.getByRole('tab', { name: 'Summary', exact: true }).click();
+                    await page.getByRole('tab', { name: 'Source', exact: true }).click();
+                } else if (interruption === 'source import') {
+                    const connector = structuredClone(channel.sourceConnector);
+                    connector.filter.elements[CUSTOM_RESPONSE_RULE].responseKey = 'newAck';
+                    const chooser = page.waitForEvent('filechooser');
+                    await page.getByRole('button', { name: 'Import Connector', exact: true }).click();
+                    await (await chooser).setFiles({ name: 'source.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify({ connector })) });
+                } else {
+                    await page.evaluate(async () => (await import(String('/core/engine-fetch.js'))).discardEngineResponses());
+                }
+                if (interruption !== 'session') {
+                    await expect(responseSelect(page).locator('option[value="newAck"]')).toHaveCount(1);
+                    await responseSelect(page).selectOption('newAck');
+                }
+                const completed = page.waitForResponse(response => response.url().endsWith('/elements/_responseVariables'));
+                release();
+                await (await completed).finished();
+                await settleResponseRendering(page);
+                await expect(responseSelect(page).locator('option[value="oldAck"]')).toHaveCount(0);
+                if (interruption !== 'session') await expect(responseSelect(page)).toHaveValue('newAck');
+                await expect(page.getByRole('status').filter({ hasText: 'Custom response variables could not be loaded.' })).toHaveCount(0);
+            } finally { release(); }
+        });
+    }
 
 });
