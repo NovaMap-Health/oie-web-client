@@ -16,7 +16,7 @@ import * as Popover from '@radix-ui/react-popover';
 import { h, icon, toast, confirmDialog, contextMenu, fmtDate, fmtNumber } from '@oie/web-ui';
 import api from '@oie/web-api';
 import { toDisplayString } from '../../core/xstream.js';
-import { getPref } from '../../core/prefs.js';
+import { getPref, PREF_DEFAULTS } from '../../core/prefs.js';
 import { ViewTasks } from '../mount.jsx';
 import { RailPane, TaskButton, DataTableHost } from '../ui.jsx';
 import { Icon } from '../bridges.jsx';
@@ -179,7 +179,7 @@ export function EventsView() {
     const [name, setName] = useState('');
     const [levels, setLevels] = useState<any>({ INFORMATION: true, WARNING: true, ERROR: true });
     const [outcome, setOutcome] = useState('');
-    const [pageSize, setPageSize] = useState(Number(getPref('eventPageSize')) || 20);
+    const [pageSize, setPageSize] = useState(() => String(Number(getPref('eventPageSize')) || PREF_DEFAULTS.eventPageSize));
     const [advancedOpen, setAdvancedOpen] = useState(false);
     const [userId, setUserId] = useState('');
     const [ip, setIp] = useState('');
@@ -205,7 +205,7 @@ export function EventsView() {
     // the pager bar. `params` are the criteria of the LAST run search, so
     // Prev/Next page through those, not whatever is typed now (classic behavior).
     const [events, setEvents] = useState([] as any[]);
-    const [page, setPage] = useState<any>({ offset: 0, limit: Number(getPref('eventPageSize')) || 20, total: 0, params: null });
+    const [page, setPage] = useState<any>({ offset: 0, limit: Number(getPref('eventPageSize')) || PREF_DEFAULTS.eventPageSize, total: 0, params: null });
 
     // Best-effort id -> username cache. A ref (not state) because the table's
     // column renderers are captured once by DataTableHost at mount; when the
@@ -269,7 +269,15 @@ export function EventsView() {
 
     // A NEW search snapshots the criteria at click time; Prev/Next re-run the
     // snapshot at a different offset.
-    const search = () => runSearch(buildParams(), 0, Number(pageSize) || 20);
+    const search = () => {
+        // Swing accepts a three-digit page size, applied only on a new search.
+        // Invalid edits must not supersede the active search or reach the engine.
+        if (!/^\d{1,3}$/.test(pageSize) || Number(pageSize) < 1) {
+            toast('Page size must be a whole number from 1 to 999.', 'error');
+            return;
+        }
+        return runSearch(buildParams(), 0, Number(pageSize));
+    };
 
     async function exportAllEvents() {
         if (!await confirmDialog('Export All Events',
@@ -346,7 +354,7 @@ export function EventsView() {
         prevDetailOpenRef.current = detailOpen;
     }, [detailOpen]);
 
-    const enterSearch = (e: any) => { if (e.key === 'Enter') search(); };
+    const enterSearch = (e: any) => { if (e.key === 'Enter') { e.preventDefault(); search(); } };
     const from = page.total === 0 ? 0 : page.offset + 1;
     const to = Math.min(page.offset + page.limit, page.total);
 
@@ -374,9 +382,10 @@ export function EventsView() {
                             </select>
                         </Field>
                         <Field label="Page Size">
-                            <select value={pageSize} onChange={(e: any) => setPageSize(Number(e.target.value))}>
-                                {[20, 50, 100].map((n: any) => <option key={n} value={n}>{n}</option>)}
-                            </select>
+                            <input type="number" min="1" max="999" step="1" aria-label="Page Size"
+                                className="w-[74px]" title="Changes take effect on a new search."
+                                value={pageSize} onChange={(e: any) => setPageSize(e.target.value)}
+                                onKeyDown={enterSearch} />
                         </Field>
                         <button className={'btn filter-adv-toggle' + (advancedOpen ? ' btn-primary' : '')} title="Show advanced search criteria"
                             onClick={() => setAdvancedOpen((o: any) => !o)}><Icon name="filter" />Advanced</button>
