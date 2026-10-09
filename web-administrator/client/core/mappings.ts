@@ -2,32 +2,55 @@
  * Shared variable-reference lists shown beside code editors: the classic
  * Administrator's "Destination Mappings" velocity tokens (connector templates)
  * and the Rhino scope cheat-sheet for channel scripts (filter/transformer steps,
- * auth scripts). Each entry is [label, insertText].
+ * auth scripts). Public lists keep the [label, insertText] shape.
  */
 
-export const DESTINATION_MAPPINGS: Array<[string, string]> = [
-    ['Channel ID', '${channelId}'],
-    ['Channel Name', '${channelName}'],
-    ['Message ID', '${message.messageId}'],
-    ['Raw Data', '${message.rawData}'],
-    ['Transformed Data', '${message.transformedData}'],
-    ['Encoded Data', '${message.encodedData}'],
-    ['Message Source', '${message.source}'],
-    ['Message Type', '${message.type}'],
-    ['Message Version', '${message.version}'],
-    ['Date', '${date}'],
-    ['Formatted Date', "${date.get('yyyy-M-d H.m.s')}"],
-    ['Timestamp', '${SYSTIME}'],
-    ['Unique ID', '${UUID}'],
-    ['Original File Name', '${originalFilename}'],
-    ['Count', '${COUNT}'],
-    ['XML Entity Encoder', '${XmlUtil.encode()}'],
-    ['XML Pretty Printer', '${XmlUtil.prettyPrint()}'],
-    ['Escape JSON String', '${JsonUtil.escape()}'],
-    ['JSON Pretty Printer', '${JsonUtil.prettyPrint()}'],
-    ['CDATA Tag', '<![CDATA[]]>'],
-    ['DICOM Message Raw Data', '${DICOMMESSAGE}']
+// [label, Velocity token, JavaScript transfer text]. Match Swing's
+// VariableListHandler / VariableTransferable: entries can be expressions,
+// statements, or raw fragments (CDATA), depending on where they are inserted.
+// Channel identity is an intentional exception: the engine exposes globals,
+// while Swing's fallback looks for unrelated map keys named after the labels.
+const destinationMappings: Array<[string, string, string | null]> = [
+    ['Channel ID', '${channelId}', 'channelId'],
+    ['Channel Name', '${channelName}', 'channelName'],
+    ['Message ID', '${message.messageId}', 'connectorMessage.getMessageId()'],
+    ['Raw Data', '${message.rawData}', 'connectorMessage.getRawData()'],
+    ['Transformed Data', '${message.transformedData}', 'connectorMessage.getTransformedData()'],
+    ['Encoded Data', '${message.encodedData}', 'connectorMessage.getEncodedData()'],
+    ['Message Source', '${message.source}', "$('mirth_source')"],
+    ['Message Type', '${message.type}', "$('mirth_type')"],
+    ['Message Version', '${message.version}', "$('mirth_version')"],
+    ['Date', '${date}', "var date = DateUtil.getDate('pattern','date');"],
+    ['Formatted Date', "${date.get('yyyy-M-d H.m.s')}", "var dateString = DateUtil.getCurrentDate('yyyy-M-d H.m.s');"],
+    ['Timestamp', '${SYSTIME}', "var dateString = DateUtil.getCurrentDate('yyyyMMddHHmmss');"],
+    ['Unique ID', '${UUID}', 'var uuid = UUIDGenerator.getUUID();'],
+    ['Original File Name', '${originalFilename}', "$('originalFilename')"],
+    ['Count', '${COUNT}', null],
+    ['XML Entity Encoder', '${XmlUtil.encode()}', "var encodedMessage = XmlUtil.encode('message');"],
+    ['XML Pretty Printer', '${XmlUtil.prettyPrint()}', "var prettyPrintedMessage = XmlUtil.prettyPrint('message');"],
+    ['Escape JSON String', '${JsonUtil.escape()}', "var escapedJSONString = JsonUtil.escape('message');"],
+    ['JSON Pretty Printer', '${JsonUtil.prettyPrint()}', "var prettyPrintedMessage = JsonUtil.prettyPrint('message');"],
+    ['CDATA Tag', '<![CDATA[]]>', '<![CDATA[]]>'],
+    ['DICOM Message Raw Data', '${DICOMMESSAGE}', 'var rawData = DICOMUtil.getDICOMRawData(connectorMessage);']
 ];
+
+export const DESTINATION_MAPPINGS: Array<[string, string]> = destinationMappings.map(([label, token]) => [label, token]);
+
+const JAVASCRIPT_DESTINATION_MAPPINGS: Array<[string, string]> = destinationMappings
+    .filter(([, , script]) => script !== null)
+    .map(([label, , script]) => [label, script!]);
+
+/** Swing's destination list uses the connector's transfer mode, not editor syntax.
+ * Source receivers and authentication scripts have separate reference contexts. */
+export function destinationMappingsFor(properties?: unknown): Array<[string, string]> {
+    if (!properties || typeof properties !== 'object'
+        || !('destinationConnectorProperties' in properties) || !properties.destinationConnectorProperties) return [];
+    const type = '@class' in properties ? properties['@class'] : undefined;
+    const javascript = type === 'com.mirth.connect.connectors.js.JavaScriptDispatcherProperties'
+        || (type === 'com.mirth.connect.connectors.jdbc.DatabaseDispatcherProperties'
+            && 'useScript' in properties && (properties.useScript === true || properties.useScript === 'true'));
+    return javascript ? JAVASCRIPT_DESTINATION_MAPPINGS : DESTINATION_MAPPINGS;
+}
 
 /* Rhino script scope — the identifiers available inside filter/transformer steps
    and channel scripts (JavaScript context). */

@@ -40,7 +40,7 @@ import {
 // Straight from core/mappings.js, not via channel-editor.jsx's re-export of it —
 // the wizard has no other reason to reference the classic editor, and that lone
 // import is what would otherwise chain the two into one bundle chunk.
-import { DESTINATION_MAPPINGS } from '../../core/mappings.js';
+import { destinationMappingsFor } from '../../core/mappings.js';
 import { useConnectorTypeSwitch } from '../connector-type-switch.js';
 
 const STEPS = ['Basics', 'Dependencies', 'Channel Options', 'Source', 'Destinations', 'Scripts', 'Review'];
@@ -253,6 +253,8 @@ function insertableAt(node: any) {
 }
 
 function insertIntoTarget(target: any, token: any, position?: any) {
+    const node = target.monaco ? target.monaco.getDomNode() : target.el;
+    if (!node?.isConnected) return false;
     if (target.monaco) {
         const inst = target.monaco;
         const pos = position || inst.getPosition();
@@ -268,14 +270,17 @@ function insertIntoTarget(target: any, token: any, position?: any) {
     if (!el || !el.isConnected) return false;
     const start = el.selectionStart ?? el.value.length;
     const end = el.selectionEnd ?? start;
-    el.value = el.value.slice(0, start) + token + el.value.slice(end);
+    const next = el.value.slice(0, start) + token + el.value.slice(end);
+    const proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+    // Match the classic rail: notify React's controlled inputs through the native setter.
+    Object.getOwnPropertyDescriptor(proto, 'value')!.set!.call(el, next);
     el.selectionStart = el.selectionEnd = start + token.length;
     el.dispatchEvent(new Event('input', { bubbles: true }));
     el.focus();
     return true;
 }
 
-function DestinationMappingsRail({ hostRef }: any) {
+function DestinationMappingsRail({ hostRef, properties }: any) {
     const targetRef = useRef<any>(null);   // last focused insertable inside hostRef
     const dragTokenRef = useRef<any>(null);
     // Shares its collapse flag with the classic editor's rail (same rail). The
@@ -347,7 +352,7 @@ function DestinationMappingsRail({ hostRef }: any) {
             </div>
             <div className="panel-body flex flex-col gap-2">
                 <div className="border border-line rounded overflow-auto max-h-[324px] min-h-[108px]">
-                    {DESTINATION_MAPPINGS.map(([label, token]) => (
+                    {destinationMappingsFor(properties).map(([label, token]) => (
                         <div key={token} role="button" draggable title={token}
                             onDragStart={(e: any) => {
                                 dragTokenRef.current = token;
@@ -428,7 +433,7 @@ function ConnectorTabs({ channel, connector, mode, version, onChange, destIndex 
                                 <ConnectorPanelMount key={connector.transportName} channel={channel} connector={connector} mode={mode} onChange={onChange} />
                             </div>
                         </div>
-                        {isDest && <DestinationMappingsRail hostRef={settingsHostRef} />}
+                        {isDest && <DestinationMappingsRail hostRef={settingsHostRef} properties={connector.properties} />}
                     </div>
                 </div>
             )}</TabsPrimitive.Content>

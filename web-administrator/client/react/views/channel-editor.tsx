@@ -97,7 +97,7 @@ const DEFAULT_ATTACHMENT_SCRIPT = '// Modify the message variable below to creat
 /* Classic Administrator "Destination Mappings" velocity variables — canonical list
    lives in core/mappings.js (shared with the wizard rail and the code-view vars). */
 export { DESTINATION_MAPPINGS } from '../../core/mappings.js';
-import { DESTINATION_MAPPINGS, SCRIPT_REFERENCE } from '../../core/mappings.js';
+import { destinationMappingsFor, SCRIPT_REFERENCE } from '../../core/mappings.js';
 
 /* Summary text shown next to the Advanced Queue Settings button, replicating
    the Swing DestinationSettingsPanel.updateAdvancedSettingsLabel(). */
@@ -2106,7 +2106,7 @@ function DestEditor({ dest, channel, version, engineTypes, markDirty, syncRows }
     );
 }
 
-function MappingsRail({ onInsert, dragRef }: any) {
+function MappingsRail({ onInsert, dragRef, mappings }: any) {
     // Shares its collapse flag with the wizard's rail — same rail, same choice.
     const [collapsed, setCollapsed] = useSideCollapse('dest-mappings');
     if (collapsed) {
@@ -2122,7 +2122,7 @@ function MappingsRail({ onInsert, dragRef }: any) {
                 </div>
             </div>
             <div className="overflow-auto flex-1 py-1 px-0">
-                {DESTINATION_MAPPINGS.map(([label, token]) => (
+                {mappings.map(([label, token]: [string, string]) => (
                     <div key={token} draggable title={token}
                         className="py-[3px] px-3 cursor-pointer text-[11px] truncate hover:bg-bg3"
                         onClick={() => onInsert(token)}
@@ -2480,7 +2480,8 @@ function DestinationsTab({ channel, version, engineTypes, markDirty, actionsRef,
                         syncRows={() => tableRef.current && tableRef.current.setRows(dests())} />
                 </div>
             </div>
-            <MappingsRail onInsert={insertToken} dragRef={dragRef} />
+            <MappingsRail onInsert={insertToken} dragRef={dragRef}
+                mappings={destinationMappingsFor(selectedDest()?.properties)} />
         </div>
     );
 }
