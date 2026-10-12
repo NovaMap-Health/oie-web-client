@@ -1,10 +1,222 @@
 // plugins/server-log/web/plugin.tsx
 import { platform } from "@oie/web-shell";
-var React = platform.React;
-var DEFAULT_LOG_SIZE = 100;
+
+// plugins/server-log/web/session.ts
 var POLL_MS = 5e3;
+var DEFAULT_LOG_SIZE = 100;
+var RETAINED = 100;
+function fingerprint(item) {
+  return JSON.stringify([item.serverId, item.id, item.date, item.level, item.category, item.message]);
+}
+function newestFirst(items) {
+  return items.filter((item) => Number.isFinite(Number(item.id))).sort((a, b) => Number(b.id) - Number(a.id));
+}
+var ServerLogSession = class {
+  constructor(fetchLogs) {
+    this.fetchLogs = fetchLogs;
+  }
+  fetchLogs;
+  snapshot = { items: [], paused: false, logSize: DEFAULT_LOG_SIZE, error: null, resetting: false };
+  listeners = /* @__PURE__ */ new Set();
+  lastItem = null;
+  lastId = null;
+  baselinePending = false;
+  restartProven = false;
+  restartRows = [];
+  recoveryVersion = 0;
+  resetVersion = 0;
+  resetPending = false;
+  disposed = false;
+  timer = null;
+  flight = null;
+  getSnapshot = () => this.snapshot;
+  subscribe = (listener) => {
+    this.listeners.add(listener);
+    if (this.listeners.size === 1) void this.poll();
+    return () => {
+      this.listeners.delete(listener);
+      if (!this.listeners.size) this.stopTimer();
+    };
+  };
+  publish(patch) {
+    this.snapshot = { ...this.snapshot, ...patch };
+    this.listeners.forEach((listener) => listener());
+  }
+  stopTimer() {
+    if (this.timer !== null) clearTimeout(this.timer);
+    this.timer = null;
+  }
+  clear() {
+    if (this.disposed) return;
+    this.resetPending = false;
+    this.baselinePending = this.baselinePending || this.lastId === null || this.flight !== null || this.restartProven;
+    this.discardRestartRows();
+    this.publish({ items: [], error: null, resetting: false });
+  }
+  /** Restore the engine's retained history without changing display settings. */
+  reset() {
+    if (this.disposed || this.resetPending && this.snapshot.resetting) return;
+    this.resetVersion++;
+    this.discardRestartRows();
+    this.resetPending = true;
+    this.baselinePending = false;
+    this.publish({ error: null, resetting: true });
+    void this.poll();
+  }
+  togglePause() {
+    if (this.disposed) return;
+    this.publish({ paused: !this.snapshot.paused });
+    this.stopTimer();
+    if (!this.snapshot.paused) void this.poll();
+  }
+  setSize(value) {
+    if (this.disposed) return;
+    const logSize = Math.max(1, Math.min(99999, Math.trunc(value) || DEFAULT_LOG_SIZE));
+    this.restartRows = this.restartRows.slice(0, logSize);
+    this.publish({ logSize, items: this.snapshot.items.slice(0, logSize) });
+  }
+  dispose() {
+    this.disposed = true;
+    this.restartProven = false;
+    this.discardRestartRows();
+    this.stopTimer();
+    this.lastId = null;
+    this.lastItem = null;
+    this.resetPending = false;
+    this.publish({ items: [], error: null, paused: false, logSize: DEFAULT_LOG_SIZE, resetting: false });
+  }
+  discardRestartRows() {
+    this.recoveryVersion++;
+    this.restartRows = [];
+  }
+  /** Retain received rows until restart recovery commits. A later observation
+   * with changed overlapping identities or a lower head belongs to a new run. */
+  rememberRestartRows(rows, version) {
+    if (this.disposed || version !== this.recoveryVersion) return rows;
+    const previous = new Map(this.restartRows.map((item) => [String(item.id), item]));
+    const changed = rows.some((item) => {
+      const old = previous.get(String(item.id));
+      return old && fingerprint(old) !== fingerprint(item);
+    });
+    const lower = rows.length && this.restartRows.length && Number(rows[0].id) < Number(this.restartRows[0].id);
+    const merged = changed || lower ? rows : rows.concat(this.restartRows);
+    const byId = /* @__PURE__ */ new Map();
+    for (const item of newestFirst(merged)) {
+      if (!byId.has(String(item.id))) byId.set(String(item.id), item);
+    }
+    this.restartRows = [...byId.values()].slice(0, this.snapshot.logSize);
+    return this.restartRows;
+  }
+  /** Read newer rows directly; only empty reads or a changed cursor need
+   * full-history verification. Preserve observations while recovering. */
+  async read(resetting) {
+    const cursor = this.lastId, last = this.lastItem;
+    if (resetting || !cursor || !last) return { history: newestFirst(await this.fetchLogs()), restarted: false };
+    const resetVersion = this.resetVersion, recoveryVersion = this.recoveryVersion;
+    const obsolete = () => this.disposed || this.resetPending && resetVersion !== this.resetVersion;
+    const same = (item) => !!item && fingerprint(item) === fingerprint(last);
+    if (!this.restartProven) {
+      const recent = newestFirst(await this.fetchLogs(cursor - 1));
+      if (obsolete()) return { history: [], restarted: false };
+      const anchor2 = recent.find((item) => Number(item.id) === cursor);
+      if (anchor2 ? same(anchor2) : recent.length > 0) return { history: recent, restarted: false };
+      if (anchor2) {
+        this.restartProven = true;
+        this.rememberRestartRows(recent, recoveryVersion);
+      }
+    }
+    let history = newestFirst(await this.fetchLogs());
+    if (obsolete()) return { history: [], restarted: false };
+    const anchor = history.find((item) => Number(item.id) === cursor);
+    const oldest = history.at(-1);
+    if (anchor ? !same(anchor) : !!oldest && Number(oldest.id) < cursor) this.restartProven = true;
+    if (this.restartProven && history.length) history = this.rememberRestartRows(history, recoveryVersion);
+    return { history, restarted: this.restartProven && history.length > 0 };
+  }
+  async receive() {
+    const resetVersion = this.resetVersion;
+    const resetting = this.resetPending;
+    const { history, restarted } = await this.read(resetting);
+    if (this.disposed || this.resetPending && resetVersion !== this.resetVersion) return;
+    const suppress = this.baselinePending;
+    if (this.snapshot.paused && !suppress && !resetting) return;
+    if (suppress && this.restartProven && !history.length) {
+      this.publish({ error: null, resetting: false });
+      return;
+    }
+    const newest = history[0];
+    const cursor = this.lastId;
+    const replace = resetting || restarted;
+    if (replace) this.restartProven = false;
+    if (replace || suppress) this.discardRestartRows();
+    const fresh = replace || cursor === null ? history : history.filter((item) => Number(item.id) > cursor);
+    if (newest) {
+      this.lastId = Number(newest.id);
+      this.lastItem = newest;
+    } else if (this.resetPending || this.lastId === null) {
+      this.lastId = 0;
+      this.lastItem = null;
+    }
+    this.baselinePending = false;
+    this.resetPending = false;
+    const byId = /* @__PURE__ */ new Map();
+    const previous = replace ? [] : this.snapshot.items;
+    for (const item of suppress ? previous : fresh.concat(previous)) {
+      if (!byId.has(String(item.id))) byId.set(String(item.id), item);
+    }
+    this.publish({ items: [...byId.values()].slice(0, this.snapshot.logSize), error: null, resetting: false });
+  }
+  poll() {
+    this.stopTimer();
+    if (this.disposed || !this.listeners.size || this.snapshot.paused && !this.resetPending) return Promise.resolve();
+    if (this.flight) return this.flight;
+    const resetVersion = this.resetVersion;
+    if (this.resetPending) this.publish({ resetting: true });
+    this.flight = this.receive().catch((error) => {
+      if (this.disposed) return;
+      if (error?.status === 403) {
+        this.discardRestartRows();
+        this.publish({ items: [] });
+      }
+      if (!this.resetPending || resetVersion === this.resetVersion) this.publish({
+        ...this.resetPending || !this.snapshot.items.length ? { error: error instanceof Error ? error.message : String(error) } : {},
+        resetting: false
+      });
+    }).finally(() => {
+      this.flight = null;
+      if (!this.disposed && this.listeners.size) {
+        if (this.resetPending && resetVersion !== this.resetVersion) {
+          void this.poll();
+        } else if (!this.snapshot.paused) {
+          this.timer = setTimeout(() => {
+            void this.poll();
+          }, POLL_MS);
+        }
+      }
+    });
+    return this.flight;
+  }
+};
+
+// plugins/server-log/web/plugin.tsx
+var React = platform.React;
+var DEFAULT_LOG_SIZE2 = 100;
 var api = platform.api;
 var { h, modal, toast } = platform.ui;
+function createSession() {
+  return new ServerLogSession(async (lastLogId) => api.asList(await api.get("/extensions/serverlog", { fetchSize: RETAINED, lastLogId }), "serverLogItem"));
+}
+var logSession = createSession();
+var userKey = (user) => user ? String(user.id ?? user.username) : null;
+var currentUser = userKey(platform.store.getState("user"));
+platform.store.subscribe("user", (user) => {
+  const next = userKey(user);
+  if (next !== currentUser) {
+    logSession.dispose();
+    logSession = createSession();
+  }
+  currentUser = next;
+});
 function formatLogDate(value) {
   if (value === null || value === void 0 || value === "") return "";
   let millis = value;
@@ -112,75 +324,14 @@ function LogRow({ item }) {
   );
 }
 function ServerLogTab() {
-  const [items, setItems] = React.useState([]);
-  const [paused, setPaused] = React.useState(false);
-  const [logSize, setLogSize] = React.useState(DEFAULT_LOG_SIZE);
-  const [sizeText, setSizeText] = React.useState(String(DEFAULT_LOG_SIZE));
-  const [error, setError] = React.useState(null);
+  const [session] = React.useState(() => logSession);
+  const { items, paused, logSize, error, resetting } = React.useSyncExternalStore(session.subscribe, session.getSnapshot);
+  const [sizeText, setSizeText] = React.useState(() => String(logSize));
   const [sort, setSort] = React.useState({ key: "timestamp", dir: -1 });
-  const itemsRef = React.useRef(items);
-  const lastLogIdRef = React.useRef(null);
-  const pausedRef = React.useRef(paused);
-  const logSizeRef = React.useRef(logSize);
-  const aliveRef = React.useRef(true);
-  const timerRef = React.useRef(null);
-  itemsRef.current = items;
-  pausedRef.current = paused;
-  logSizeRef.current = logSize;
-  const poll = React.useCallback(async function poll2() {
-    if (timerRef.current) {
-      clearTimeout(timerRef.current);
-      timerRef.current = null;
-    }
-    if (!aliveRef.current) return;
-    if (!pausedRef.current) {
-      try {
-        const raw = await api.get("/extensions/serverlog", { fetchSize: logSizeRef.current, lastLogId: lastLogIdRef.current });
-        if (!aliveRef.current) return;
-        const fresh = api.asList(raw, "serverLogItem");
-        if (fresh.length) {
-          fresh.sort((a, b) => Number(b.id) - Number(a.id));
-          lastLogIdRef.current = Number(fresh[0].id);
-          setItems((prev) => fresh.concat(prev).slice(0, logSizeRef.current));
-          setError(null);
-        } else {
-          setError(null);
-        }
-      } catch (e) {
-        if (!itemsRef.current.length) setError(e.message);
-      }
-    }
-    if (aliveRef.current) timerRef.current = setTimeout(poll2, POLL_MS);
-  }, []);
-  React.useEffect(() => {
-    aliveRef.current = true;
-    poll();
-    return () => {
-      aliveRef.current = false;
-      if (timerRef.current) {
-        clearTimeout(timerRef.current);
-        timerRef.current = null;
-      }
-    };
-  }, [poll]);
-  function togglePause() {
-    setPaused((prev) => {
-      const next = !prev;
-      pausedRef.current = next;
-      if (!next) poll();
-      return next;
-    });
-  }
-  function clearLog() {
-    setItems([]);
-    setError(null);
-  }
   function applySize() {
-    const n = Math.max(1, Math.min(99999, parseInt(sizeText, 10) || DEFAULT_LOG_SIZE));
-    logSizeRef.current = n;
-    setLogSize(n);
+    const n = Math.max(1, Math.min(99999, parseInt(sizeText, 10) || DEFAULT_LOG_SIZE2));
+    session.setSize(n);
     setSizeText(String(n));
-    setItems((prev) => prev.length > n ? prev.slice(0, n) : prev);
   }
   const btnClass = "py-[1px] px-1.5 h-[20px] leading-none";
   function handleSort(key) {
@@ -195,7 +346,19 @@ function ServerLogTab() {
     });
   }, [items, sort]);
   const headerTh = (key, label, extra = "") => /* @__PURE__ */ React.createElement("th", { className: "sortable sticky top-0 z-[1] bg-bg2 text-left " + extra, onClick: () => handleSort(key) }, label, sort.key === key ? /* @__PURE__ */ React.createElement("span", { className: "sort-arrow" }, sort.dir > 0 ? "\u25B2" : "\u25BC") : null);
-  return /* @__PURE__ */ React.createElement("div", { className: "flex flex-col h-full min-h-0" }, /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-h-0 overflow-y-auto overflow-x-hidden" }, /* @__PURE__ */ React.createElement("table", { className: "dt server-log w-full" }, /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", null, headerTh("timestamp", "Timestamp", "w-[160px]"), headerTh("level", "Level", "w-[76px]"), headerTh("message", "Message"))), /* @__PURE__ */ React.createElement("tbody", null, error && !items.length ? /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { colSpan: 3, className: "text-text-faint p-3" }, `Server Log unavailable: ${error}`)) : !items.length ? /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { colSpan: 3, className: "text-text-faint p-3" }, "No server log entries yet.")) : sortedItems.map((item) => /* @__PURE__ */ React.createElement(LogRow, { key: item.id, item }))))), /* @__PURE__ */ React.createElement("div", { className: "taskbar flex items-center gap-1.5 py-[3px] px-2 flex-none text-[11px] z-[2] bg-bg2 border-t border-[var(--bg3)]" }, /* @__PURE__ */ React.createElement("button", { className: "icon-btn " + btnClass, title: "Pause or resume the live log", onClick: togglePause }, /* @__PURE__ */ React.createElement("span", { className: "text-[11.5px] leading-none" }, paused ? "\u23F5" : "\u23F8")), /* @__PURE__ */ React.createElement("button", { className: "icon-btn " + btnClass, title: "Clear the displayed log", onClick: clearLog }, /* @__PURE__ */ React.createElement("span", { className: "text-err font-bold" }, "\u2715")), /* @__PURE__ */ React.createElement("span", { className: "flex-1" }), /* @__PURE__ */ React.createElement("label", { className: "text-text-faint mr-0.5" }, "Log Size:"), /* @__PURE__ */ React.createElement(
+  return /* @__PURE__ */ React.createElement("div", { className: "flex flex-col h-full min-h-0" }, /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-h-0 overflow-y-auto overflow-x-hidden" }, /* @__PURE__ */ React.createElement("table", { className: "dt server-log w-full", "aria-busy": resetting }, /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", null, headerTh("timestamp", "Timestamp", "w-[160px]"), headerTh("level", "Level", "w-[76px]"), headerTh("message", "Message"))), /* @__PURE__ */ React.createElement("tbody", null, error && /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { colSpan: 3, className: "text-text-faint p-3" }, `Server Log unavailable: ${error}`)), items.length ? sortedItems.map((item) => /* @__PURE__ */ React.createElement(LogRow, { key: item.id, item })) : !error && /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { colSpan: 3, className: "text-text-faint p-3" }, resetting ? "Loading recent server log entries\u2026" : "No server log entries yet."))))), /* @__PURE__ */ React.createElement("div", { className: "taskbar flex items-center gap-1.5 py-[3px] px-2 flex-none text-[11px] z-[2] bg-bg2 border-t border-[var(--bg3)]" }, /* @__PURE__ */ React.createElement("button", { className: "icon-btn " + btnClass, title: "Pause or resume the live log", onClick: () => session.togglePause() }, /* @__PURE__ */ React.createElement("span", { className: "text-[11.5px] leading-none" }, paused ? "\u23F5" : "\u23F8")), /* @__PURE__ */ React.createElement("button", { className: "icon-btn " + btnClass, title: "Clear the displayed log", onClick: () => session.clear() }, /* @__PURE__ */ React.createElement("span", { className: "text-err font-bold" }, "\u2715")), /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      className: "icon-btn " + btnClass + " disabled:opacity-40 disabled:cursor-wait",
+      "aria-label": "Reset",
+      disabled: resetting,
+      title: resetting ? "Resetting displayed log\u2026" : "Reset displayed log: reload the entries the server retains (up to 100)",
+      onClick: () => session.reset()
+    },
+    /* @__PURE__ */ React.createElement("span", { className: "inline-flex", "aria-hidden": "true", ref: (el) => {
+      if (el && !el.firstChild) el.appendChild(platform.ui.icon("undo", 14));
+    } })
+  ), /* @__PURE__ */ React.createElement("span", { className: "flex-1" }), /* @__PURE__ */ React.createElement("label", { className: "text-text-faint mr-0.5" }, "Log Size:"), /* @__PURE__ */ React.createElement(
     "input",
     {
       type: "number",
