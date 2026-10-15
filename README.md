@@ -44,7 +44,6 @@ oie-web-client/
     ├── plugins/              bundled web plugins (server + browser extensions)
     ├── PLUGINS.md            plugin development guide (worked examples)
     ├── RBAC.md               role-based access control hooks + permission catalog
-    ├── docs/                 parity / feedback notes
     ├── config.example.json   copy to config.json and edit
     └── package.json
 ```
@@ -403,8 +402,8 @@ OIE 4.6.0 installations with and without Web Support, and test both Docker
 architectures before publication. Upgrade/rollback CI uses the pinned 0.9.0
 baseline; it does not claim to exercise every intervening release.
 
-Add release notes at `docs/releases/vX.Y.Z.md`. When creating a new release,
-the publisher uses that file; an existing draft keeps its edited notes.
+Maintain release notes on GitHub. The publisher creates new releases with
+deployment instructions; an existing draft keeps its edited notes.
 The GitHub assets are `oie-webadmin.war`, `oie-webadmin-node.tar.gz`, their
 individual `.sha256` files, and `release-receipt.json` recording the source
 commit, version and artifact hashes.
@@ -414,8 +413,8 @@ tagging Web Support. Its release pipeline consumes the client version declared
 by `webclient.version`, verifies the WAR checksum and receipt against the client
 tag, signs the plugin JAR, and checks the bundled WAR remains byte-identical.
 The signed `websupport-X.Y.Z.zip` and `SHA256SUMS` are then published, followed
-by the automated community-catalog PR. For the coordinated 1.1.0 release, use
-[Web Client 1.1.0 notes](docs/releases/v1.1.0.md) and Web Support 1.1.0.
+by the automated community-catalog PR. Pair Web Client 1.1.0 with Web Support
+1.1.0 for the coordinated release.
 
 Git supplies only the build *metadata* beside it (commit, build date, and a
 `dirty` flag when the tree had uncommitted changes), stamped into a gitignored
