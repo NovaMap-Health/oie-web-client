@@ -33,27 +33,65 @@ export interface AuthorizationController {
 }
 
 const ALLOW_ALL: AuthorizationController = { checkTask: () => true };
+const DENY_ALL: AuthorizationController = { checkTask: () => false };
 let controller: AuthorizationController = ALLOW_ALL;
+let phase: 'ready' | 'discovering' | 'registering' | 'blocked' = 'ready';
+let registrationRequiresController = false;
+let revision = 0;
+let registered = false;
+
+/** A failed bootstrap or invalidated session cannot be released by a controller. */
+export function blockAuthorization(value: boolean): void {
+    phase = value ? 'blocked' : 'ready';
+    registrationRequiresController = false;
+}
+
+/** Keep unknown discovery from exposing the default unrestricted controller. */
+export function beginAuthorizationDiscovery(): void { phase = 'discovering'; }
+
+/** Internal loader boundary. Views remain gated by shell readiness while plugins
+ * query the installed controller and construct their permission-dependent UI. */
+export function beginAuthorizationRegistration(required: boolean): void {
+    if (phase !== 'discovering') throw new Error('Authorization discovery was invalidated');
+    registrationRequiresController = required;
+    phase = 'registering';
+}
+
+/** Receipt used to verify that an authorization plugin installed its controller. */
+export function authorizationRegistration(): { revision: number; registered: boolean } {
+    return { revision, registered };
+}
 
 /** Register the RBAC controller (or clear it by passing null). */
 export function setAuthorizationController(ctrl: AuthorizationController | null | undefined): void {
-    controller = (ctrl && typeof ctrl.checkTask === 'function') ? ctrl : ALLOW_ALL;
+    revision++;
+    registered = !!ctrl && typeof ctrl.checkTask === 'function';
+    controller = registered ? ctrl! : ctrl == null ? ALLOW_ALL : DENY_ALL;
     if (controller.initialize) {
-        try { controller.initialize(); } catch (e) { console.warn('[auth] controller.initialize failed:', e); }
+        try { controller.initialize(); } catch (e) {
+            controller = DENY_ALL;
+            registered = false;
+            throw e;
+        }
     }
 }
 
 /**
  * True if the user may see/use the task. Untagged items (no task name) are
- * always allowed, and a throwing controller fails OPEN (visible) — matching
- * Swing's DefaultAuthorizationController, which permits everything.
+ * allowed after discovery, while a throwing controller denies tagged tasks.
+ * Unknown discovery, failed bootstrap and invalidated sessions deny all checks.
+ * During registration the installed controller answers normally; a required
+ * provider must install one before any task can be allowed. The shell separately
+ * withholds views and commands until every required provider has succeeded.
  *
  * A task WITHOUT a group is still checked (group passed as ''): tagging a task
  * signals gating intent, and RBAC controllers resolve bare Swing task names
  * without the group — so a missing group tag must not silently fail open.
  */
 export function checkTask(taskGroup: string | null | undefined, taskName: string | null | undefined): boolean {
+    if (phase === 'blocked' || phase === 'discovering') return false;
+    if (phase === 'registering' && registrationRequiresController && !registered) return false;
     if (!taskName) return true;
     try { return controller.checkTask(taskGroup || '', taskName) !== false; }
-    catch { return true; }
+    catch { return false; }
 }

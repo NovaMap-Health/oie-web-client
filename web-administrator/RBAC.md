@@ -37,6 +37,27 @@ Semantics (`client/core/authorization.ts`):
 
 - **`checkTask(group, task)` returning `false` hides** the matching nav item, task
   button, and its right-click twin. Any other return value shows it.
+- A successfully discovered engine with no authorization controller keeps the
+  default unrestricted UI. Untagged items remain visible. A controller that throws
+  denies the tagged task; an initialization failure also denies access.
+- Discovery must finish before views mount. Discovery or manifest failures block
+  startup with a reload action. API 4.9 recognizes `"authorization": true` in a
+  manifest so it knows a provider is required even when its module cannot load.
+  Providers with another ID must declare it; legacy `id: "rbac"` is recognized
+  without a manifest change. Ordinary plugins need no marker.
+- Required providers register first, retaining their relative manifest order;
+  ordinary plugins then register in their relative order. During registration,
+  `platform.checkTask` reflects the installed controller, so plugins can still
+  conditionally register their panels or actions. With a required provider,
+  checks deny until a controller is installed. Views, navigation and the command
+  palette remain unavailable until the whole bootstrap succeeds.
+- Missing/incompatible provider modules, failed registration, or registration
+  without a valid controller block startup. Ordinary module failures, and
+  registration failures that do not modify authorization, stay isolated. An unreadable or
+  invalid manifest blocks startup because its provider status is unknown.
+- A task without a group is still checked with `''` as its group. Task buttons
+  check again on invocation; multi-step handlers must also check after their own
+  asynchronous prompts before performing a restricted action.
 - **Built-in route entry** uses the same checks, including direct URLs and browser
   history. Nested editors require both their parent view permission and their
   entry action (for example, `view/doShowChannel` and `channel/doEditChannel`).
@@ -50,19 +71,19 @@ Semantics (`client/core/authorization.ts`):
   that draft. Returning to the same model preserves it.
 - **Palette destinations** require the same view/action prerequisites as their
   routes. Commands may declare additional `permissions: [[group, task], ...]`;
-  every pair must pass along with the existing `task`/`rbac` pair. Checks run when
-  entries are built and again before activation. Template suggestions, search,
-  recents, and their background library reads also require route access.
-- **Fail-open.** A missing controller, an untagged item (no `task`), or a
-  controller that throws all resolve to *visible* — exactly like Swing's
-  `DefaultAuthorizationController`. RBAC can only ever *remove* options, never break
-  the UI. A `task` **without** a `group` is still checked (the group is passed as
-  `''`): tagging a task signals gating intent, and RBAC controllers resolve bare
-  Swing task names without the group — a missing group tag must not silently fail
-  open.
+  every pair must pass along with the existing `task`/`rbac` pair and any
+  `visible()` predicate. Checks run when entries are built and again before
+  activation. Template suggestions, search, recents, and their background
+  library reads also require route access.
 - There is one current controller; a later registration replaces it. Register
   yours in `register(platform)` (which runs during plugin load, before views
   mount).
+
+Failing closed on discovery/controller errors intentionally replaces the old
+permissive error behavior. The controller and `register(platform)` signatures
+are unchanged, and this changes no engine endpoint or server authorization API.
+Older hosts ignore the new marker; an `apiMin` requirement alone cannot give
+them required-provider enforcement. Upgrade the host before relying on it.
 
 ### Implementing an RBAC plugin
 
@@ -129,7 +150,12 @@ The built-in route checks do not automatically protect routes contributed throug
 mounting content or starting requests. Server-side authorization remains required
 for every endpoint, including resource-level restrictions within an allowed view.
 After permissions recover or change, navigate to the page again (or reload) to
-re-evaluate route access and the visible Settings tabs.
+re-evaluate route access. Mounted Settings views, the navigation rail, and the
+command palette refresh their available items when the provider publishes a
+`webPlugins` notification. Replacing the controller through
+`platform.setAuthorizationController` publishes that notification automatically;
+changing permission data within an existing controller requires the provider to
+publish it. This notification does not automatically reroute the current view.
 
 ---
 
@@ -158,6 +184,8 @@ re-evaluate route access and the visible Settings tabs.
 - `doStartConnector` — Start Connector · `doStopConnector` — Stop Connector
 
 ### `channel` — Channel Tasks (Channels view)
+- `doEditGlobalScripts` — Global Scripts navigation
+- `doEditCodeTemplates` — Code Templates navigation
 - `doRefreshChannels` — Refresh
 - `doRedeployAll` — Redeploy All
 - `doDeployChannel` — Deploy Channel *(Debug Channel is `channelEdit/doDebugDeployFromChannelView`, in the channel editor)*
@@ -252,6 +280,7 @@ Shared on every tab: `doRefresh` — Refresh · `doSave` — Save.
   The in-panel **Add Row** button also rides `doSave` (no separate identifier —
   adding a row is meaningless without save rights)
 - **`settings_Database Tasks`** — `doRunDatabaseTask` (Run Task), `doCancelDatabaseTask` (Cancel Task)
+- **`settings_Data Pruner`** — `doRefresh` (View Settings), `doSave` (Save Settings), `doStart` and `doStop` (Start / Stop). These require scoped mappings because the bare start/stop names also identify channel controls.
 - **`settings_Resources`** — `doAddResource` (Add Resource), `doRemoveResource` (Remove Resource), `doReloadResource` (Reload Resource)
 
 ---

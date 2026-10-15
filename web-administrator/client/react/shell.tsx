@@ -37,6 +37,7 @@ import { disposeDetachedMonaco } from '../core/monaco.js';
 import { invalidate as invalidateCompletions, clearActiveScope } from '../core/script-completions.js';
 import { apiUrl, appUrl, routeUrl } from '../core/deployment.js';
 import { platform, loadPlugins } from '@oie/web-shell';
+import { BUILTIN_SETTINGS_LABELS, canViewSettingsTab, settingsTabId } from '../core/settings-navigation.js';
 import { LoginForm, isOidcCallback, isExpectedOidcCallback, takeOidcCallback, takePendingLoginFinish } from './views/login.jsx';
 import { openEditUserModal, openChangePasswordModal } from './views/user-modals.js';
 import { maybeShowWelcome } from './welcome.js';
@@ -304,11 +305,6 @@ const OTHER_ACTIONS = [
    no selection: the create/import entry points (which are routes), the settings
    sections (deep links), and the session actions. A view's selection-dependent
    tasks stay in its task pane, where the selection lives. */
-const SETTINGS_TABS = [
-    ['Server', 'server'], ['Administrator', 'administrator'], ['Tags', 'tags'],
-    ['Configuration Map', 'configurationmap'], ['Database Tasks', 'databasetasks'],
-    ['Resources', 'resources'], ['Data Pruner', 'datapruner']
-];
 
 function registerCommands(plat: any) {
     /* The wizard routes, which are reachable from anywhere. "New Channel" in the
@@ -324,10 +320,11 @@ function registerCommands(plat: any) {
         permissions: NEW_ALERT_TASKS,
         keywords: 'create add alert', path: '/alerts/new/guided?fresh=1' });
 
-    SETTINGS_TABS.forEach(([label, tab], i) => plat.registerCommand({
-        id: 'settings-' + tab, label: 'Settings: ' + label, icon: 'settings', section: 'Settings',
+    BUILTIN_SETTINGS_LABELS.forEach((label, i) => plat.registerCommand({
+        id: 'settings-' + settingsTabId(label), label: 'Settings: ' + label, icon: 'settings', section: 'Settings',
         order: i, task: 'doShowSettings', rbac: 'view', keywords: label,
-        path: '/settings?tab=' + tab
+        visible: () => canViewSettingsTab(plat, label),
+        path: '/settings?tab=' + settingsTabId(label)
     }));
 
     plat.registerCommand({ id: 'toggle-theme', label: 'Toggle light/dark mode', icon: 'sun',
@@ -352,6 +349,23 @@ function registerViewRoutes(plat: any) {
 let engineStarted: any = null;
 function startEngine() {
     if (engineStarted) return engineStarted;
+    const assertSession = captureEngineSession();
+    // Record which engine these plugins were discovered against. Plugin views
+    // register into module-level registries that a soft sign-out doesn't clear,
+    // so a later sign-in to a DIFFERENT engine (same page session) would show the
+    // wrong engine's panels. login.jsx compares against this and forces a reload
+    // when the target engine changes (see loadedEngineKey / engineSelectionKey).
+    try { sessionStorage.setItem('oie-loaded-engine', loadedEngineKey()); } catch { /* private mode */ }
+    // And which USER. The RBAC plugin loads the signed-in user's permission
+    // set once, here, and never again in this page session — so a soft
+    // sign-out followed by a sign-in in the same tab would run the new
+    // session under the old permission set (an administrator signing in
+    // after a viewer got a view-only Settings page; a role re-synced at
+    // sign-in was not seen until a reload). login.tsx treats this marker as
+    // "plugins already loaded here" and forces a reload on any later sign-in.
+    try { sessionStorage.setItem('oie-loaded-user', String(store.getState('user')?.username ?? '')); } catch { /* private mode */ }
+    // Mark even an unsuccessful attempt: partial plugin registration cannot
+    // be replayed safely after a soft sign-out and sign-in.
     engineStarted = (async () => {
         // Share the host's React with plugins (so plugin components use the same
         // instance the app renders with). Set before any plugin/view registers.
@@ -364,6 +378,8 @@ function startEngine() {
             const res = await fetch(appUrl('/webadmin/config.json'));
             if (res.ok) store.setState('webadminConfig', await res.json());
         } catch { /* optional */ }
+
+        assertSession();
 
         // Warm Monaco in the background; air-gapped installs keep the baseline editor.
         import('../core/monaco.js').then((m: any) => m.ensureMonaco()).catch(() => {});
@@ -387,20 +403,6 @@ function startEngine() {
         });
 
         await loadPlugins();
-        // Record which engine these plugins were discovered against. Plugin views
-        // register into module-level registries that a soft sign-out doesn't clear,
-        // so a later sign-in to a DIFFERENT engine (same page session) would show the
-        // wrong engine's panels. login.jsx compares against this and forces a reload
-        // when the target engine changes (see loadedEngineKey / engineSelectionKey).
-        try { sessionStorage.setItem('oie-loaded-engine', loadedEngineKey()); } catch { /* private mode */ }
-        // And which USER. The RBAC plugin loads the signed-in user's permission
-        // set once, here, and never again in this page session — so a soft
-        // sign-out followed by a sign-in in the same tab would run the new
-        // session under the old permission set (an administrator signing in
-        // after a viewer got a view-only Settings page; a role re-synced at
-        // sign-in was not seen until a reload). login.tsx treats this marker as
-        // "plugins already loaded here" and forces a reload on any later sign-in.
-        try { sessionStorage.setItem('oie-loaded-user', String(store.getState('user')?.username ?? '')); } catch { /* private mode */ }
     })();
     return engineStarted;
 }
@@ -499,7 +501,7 @@ function ServerChip({ info }: any) {
     return <div className="server-chip"><span>{identity}</span></div>;
 }
 
-function TopBar({ user, onLogout, serverInfo }: any) {
+function TopBar({ user, onLogout, serverInfo, ready }: any) {
     const title = useViewTitle();
     const { theme, toggle } = useTheme();
     const tz = useTimezone();
@@ -525,7 +527,7 @@ function TopBar({ user, onLogout, serverInfo }: any) {
             <button className="icon-btn" title="Toggle light/dark mode" onClick={toggle}>
                 <Icon name={theme === 'light' ? 'moon' : 'sun'} />
             </button>
-            <UserMenu user={user} onLogout={onLogout} />
+            <UserMenu user={user} onLogout={onLogout} ready={ready} />
         </header>
     );
 }
@@ -599,7 +601,8 @@ async function switchEngine(onLogout: any) {
    management, typeahead and Escape; we keep the RBAC gating (a task the user is not
    authorized for renders nothing, exactly as the popup did) and the .ctx-menu skin
    so it still looks like every other menu in the app. */
-function UserMenu({ user, onLogout }: any) {
+function UserMenu({ user, onLogout, ready }: any) {
+    useStoreKey('webPlugins');
     const me = store.getState('user') || user;
     const config = store.getState('webadminConfig') || {};
     const fullName = [me?.firstName, me?.lastName].filter(Boolean).join(' ');
@@ -608,7 +611,7 @@ function UserMenu({ user, onLogout }: any) {
         try { const u = await api.auth.current(); if (u && u.username) store.setState('user', u); }
         catch { /* keep current */ }
     };
-    const can = (group: any, task: any) => !task || platform.checkTask(group, task);
+    const can = (group: any, task: any) => ready && (!task || platform.checkTask(group, task));
     const item = (label: any, icon: any, onSelect: any) => (
         <DropdownMenu.Item className="ctx-item" onSelect={onSelect}>
             <Icon name={icon} />{label}
@@ -633,10 +636,12 @@ function UserMenu({ user, onLogout }: any) {
                         would set a local credential that SSO never consults. Omitted
                         rather than greyed: a disabled row in a short menu is noise. */}
                     {!isSsoSession() && item('Change Password', 'key', () => openChangePasswordModal(store.getState('user') || me))}
-                    {can('view', 'doShowSettings') && item('Settings', 'settings', () => router.navigate('/settings?tab=administrator'))}
+                    {can('view', 'doShowSettings') && item('Settings', 'settings', () => {
+                        if (can('view', 'doShowSettings')) router.navigate('/settings?tab=administrator');
+                    })}
                     <DropdownMenu.Separator className="ctx-sep" />
                     {engineChoiceAvailable(config) && item('Switch Engine', 'link', () => switchEngine(onLogout))}
-                    {can('other', 'doLogout') && item('Sign out', 'logout', () => onLogout())}
+                    {item('Sign out', 'logout', () => onLogout())}
                 </DropdownMenu.Content>
             </DropdownMenu.Portal>
         </DropdownMenu.Root>
@@ -744,6 +749,8 @@ function RestartBanner() {
 /* ---- shell ---- */
 
 function AppShell({ user, onLogout }: any) {
+    const [bootError, setBootError] = useState(false);
+    const [bootReady, setBootReady] = useState(false);
     const outletRef = useRef<any>(null);
     const reactTasksRef = useRef<any>(null);
     const serverInfo = useServerIdentity();
@@ -759,11 +766,16 @@ function AppShell({ user, onLogout }: any) {
             // after and remounting the view to restamp would tear the view down
             // mid-boot — a click landing in that gap is silently eaten. Riding
             // alongside startEngine, it costs boot no extra round trip.
-            await Promise.all([
+            try { await Promise.all([
                 startEngine(),
                 import('../core/timezone.js').then((tz: any) => tz.loadServerTimezone()).catch(() => {}),
-            ]);
+            ]); } catch (error) {
+                console.error('[plugins] access controls could not be loaded:', error);
+                if (!cancelled) setBootError(true);
+                return;
+            }
             if (cancelled) return;
+            setBootReady(true);
             router.setOutlet(outletRef.current);
             // Land on the dashboard for a bare root URL; a deep link (refresh /
             // bookmark of /channels/x/edit) is left intact for the router to match.
@@ -820,15 +832,15 @@ function AppShell({ user, onLogout }: any) {
                     app's groups, a plugin's section, the Other actions and groups
                     the user invents. See react/nav-rail.jsx. */}
                 <div className="rail-panes">
-                    <NavRail collapsed={railCollapsed} onPeek={setPeek} onLogout={onLogout} />
+                    {bootReady && <NavRail collapsed={railCollapsed} onPeek={setPeek} onLogout={onLogout} />}
                 </div>
                 <div className="rail-foot"><span id="rail-version">{railVersion}</span></div>
             </aside>
-            <CommandPalette />
+            <CommandPalette ready={bootReady} />
             {/* Off-canvas drawer backdrop (phone/tablet only via CSS) — tap to close. */}
             {railCollapsed && <RailFlyout target={peek} />}
             <div className="rail-backdrop" onClick={() => store.setState('railCollapsed', true)} />
-            <TopBar user={user} onLogout={onLogout} serverInfo={serverInfo} />
+            <TopBar user={user} onLogout={onLogout} serverInfo={serverInfo} ready={bootReady} />
             <div className="content">
                 <RestartBanner />
                 {/* Every view's task pane lands here through <ViewTasks> — its own
@@ -837,7 +849,16 @@ function AppShell({ user, onLogout }: any) {
                     collapsed away by CSS) for views that declare no tasks. */}
                 <div className="content-row">
                     <div className="view-tasks" ref={reactTasksRef} />
-                    <main ref={outletRef} style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }} />
+                    <main ref={outletRef} style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+                        {bootError && <div className="panel" role="alert">
+                            <div className="panel-header">Unable to load access controls</div>
+                            <div className="panel-body">
+                                <p>Your permissions could not be verified. Reload to try again.</p>
+                                <button className="btn btn-primary" onClick={() => window.location.reload()}>Reload</button>
+                                <button className="btn" onClick={onLogout}>Sign out</button>
+                            </div>
+                        </div>}
+                    </main>
                 </div>
             </div>
             <StatusBar user={user} serverInfo={serverInfo} conn={conn} />

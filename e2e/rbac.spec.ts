@@ -840,20 +840,32 @@ async function retainedModel(page: Page, family: string) {
         return model ? { id: model.id, name: model.name } : null;
     }, family);
 }
-async function openRetainedHandoff(page: Page, child: string, revokeBeforeClick = false) {
+async function openRetainedHandoff(page: Page, child: string, deniedPath?: string) {
     if (child === 'Filter') {
         await page.getByRole('tab', { name: 'Source', exact: true }).click();
     }
     const action = page.getByRole('button', { name: child === 'Filter' ? 'Edit Filter' : 'Open in Wizard', exact: true });
     await expect(action).toBeVisible();
-    if (revokeBeforeClick) {
-        // Render the task while permitted, then change authorization and use
-        // that stale action. Revoking before selecting Source correctly hides
-        // Edit Filter and would never exercise route-entry denial.
+    if (deniedPath) {
+        const sourceUrl = page.url();
+        const original = child === 'Filter' ? await retainedModel(page, 'channels') : null;
+        // Render while permitted, then revoke without notifying React. Tagged
+        // task buttons must reject this stale click at action time.
         await action.evaluate(element => {
             (window as any).__denyHandoff = true;
             (element as HTMLElement).click();
         });
+        if (child === 'Filter') {
+            await expect(page).toHaveURL(sourceUrl);
+            await expect(page.getByRole('tab', { name: 'Source', exact: true })).toHaveAttribute('aria-selected', 'true');
+            await expect(page.getByRole('dialog')).toHaveCount(0);
+            expect(await retainedModel(page, 'channels')).toEqual(original);
+            expect(await hasUnsavedWork(page)).toBe(true);
+            // History, bookmarks and plugin navigation can still request the
+            // denied URL. Exercise the independent route gate and retained-draft
+            // protection without weakening the blocked task-button behavior.
+            await navigateWithinShell(page, deniedPath);
+        }
     } else await action.click();
 }
 
@@ -883,8 +895,8 @@ for (const { family, kind, child, segment, module, group, task } of retainedDraf
                 const name = page.locator('.view-body input[type=text]').first();
                 await name.fill('Keep this retained draft');
                 await name.blur();
-                await openRetainedHandoff(page, child, timing === 'denied before import');
                 const handoffPath = `/${family}/retained/${segment}`;
+                await openRetainedHandoff(page, child, timing === 'denied before import' ? handoffPath : undefined);
                 await expect(page).toHaveURL(new RegExp(handoffPath + '$'));
                 if (timing !== 'denied before import') await expect.poll(() => held).toBe(true);
                 if (timing === 'revoked during import') {
@@ -940,7 +952,7 @@ for (const { family, kind, child, segment, module, group, task } of retainedDraf
         const name = page.locator('.view-body input[type=text]').first();
         await name.fill('Resume this retained draft');
         await name.blur();
-        await openRetainedHandoff(page, child, true);
+        await openRetainedHandoff(page, child, `/${family}/retained/${segment}`);
         await expectDenied(page, errors);
         await page.evaluate(() => { (window as any).__denyHandoff = false; });
         await navigateWithinShell(page, `/${family}/retained/edit`);

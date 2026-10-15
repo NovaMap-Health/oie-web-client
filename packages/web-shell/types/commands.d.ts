@@ -8,6 +8,8 @@ export interface Command {
     keywords?: string | string[];
     task?: string;
     rbac?: any;
+    /** API 4.9: additional availability predicate, rechecked when the command runs. */
+    visible?: () => boolean;
     /** Additional all-of prerequisites, checked alongside `task`/`rbac`. */
     permissions?: RouteTasks;
     /** Navigation target; `run` is called instead when present. */

@@ -28,10 +28,11 @@ import api, * as oie from '@oie/web-api';
 import { platform } from '../core/platform.js';
 import { allCommands, commandPermissions, fuzzyMatch } from '../core/commands.js';
 import { checkTask } from '../core/authorization.js';
+import { BUILTIN_SETTINGS_LABELS, canViewSettingsTab, settingsTabId } from '../core/settings-navigation.js';
 import { getPref, setPrefs } from '../core/prefs.js';
 import * as router from '../core/router.js';
 import { queryClient } from './queries.js';
-import { Icon } from './bridges.jsx';
+import { Icon, useStoreKey } from './bridges.jsx';
 import { canBrowseTemplates, channelPaletteEntries, contextSuggestions, entryAllowed, templatePaletteEntries } from '../core/command-suggestions.js';
 import { useCurrentPaletteContext } from './palette-context.js';
 
@@ -72,24 +73,49 @@ function Highlight({ text, hits }: any) {
 
 /* ---- the entries ------------------------------------------------------------ */
 
+function permitted(entry: any) {
+    return entryAllowed(entry, checkTask) && (!entry.allowed || entry.allowed());
+}
+
 function viewEntries() {
     return platform.navItems()
-        .filter((item: any) => !item.task || checkTask(item.rbac || 'view', item.task))
         .map((item: any) => ({
             kind: 'view', id: 'view:' + item.id, label: item.label, icon: item.icon || 'chevR',
             group: 'Views', hint: item.path || '', path: item.path, run: item.action,
-            permissions: item.task ? [[item.rbac || 'view', item.task]] : []
-        }));
+            permissions: item.task ? [[item.rbac || 'view', item.task]] : [],
+            allowed: () => !item.visible || item.visible()
+        }))
+        .filter(permitted);
 }
 
 function commandEntries() {
-    return allCommands()
+    const commands = allCommands();
+    const ids = new Set(commands.map(command => command.id));
+    // Derive plugin destinations from the current panel registry. Recovery adds
+    // them to an already-open palette without accumulating registrations.
+    for (const panel of platform.settingsPanels()) {
+        const label = panel.label;
+        const id = 'settings-' + settingsTabId(label);
+        if (ids.has(id) || BUILTIN_SETTINGS_LABELS.includes(label)) continue;
+        ids.add(id);
+        commands.push({
+            id, label: 'Settings: ' + label, icon: 'settings', section: 'Settings',
+            order: BUILTIN_SETTINGS_LABELS.length, keywords: label,
+            task: 'doShowSettings', rbac: 'view', path: '/settings?tab=' + encodeURIComponent(label),
+            visible: () => canViewSettingsTab(platform, label)
+                && platform.settingsPanels().some(current => current.label === label)
+        });
+    }
+    return commands
+        .sort((a, b) => String(a.section || '').localeCompare(String(b.section || ''))
+            || (a.order ?? 100) - (b.order ?? 100) || String(a.label).localeCompare(String(b.label)))
         .map((c: any) => ({
             kind: 'command', id: 'cmd:' + c.id, label: c.label, icon: c.icon || 'chevR',
             group: c.section || 'Commands', hint: c.hint || '', path: c.path, run: c.run,
-            keywords: c.keywords || '', permissions: commandPermissions(c)
+            keywords: c.keywords || '', permissions: commandPermissions(c),
+            allowed: () => !c.visible || c.visible()
         }))
-        .filter(entry => entryAllowed(entry, checkTask));
+        .filter(permitted);
 }
 
 /* Channels come from whatever the dashboard has already polled — the
@@ -110,8 +136,15 @@ function cachedChannels() {
 
 /* ---- the component ---------------------------------------------------------- */
 
-export function CommandPalette() {
-    const [open, setOpen] = useState(false);
+export function CommandPalette({ ready }: { ready: boolean }) {
+    const permissions = useStoreKey('webPlugins');
+    // Keep the shortcut listener available as soon as the shell mounts, but
+    // reveal nothing and make no requests before access controls are ready.
+    const [openRequested, setOpen] = useState(false);
+    const open = ready && openRequested;
+    const readyRef = useRef(ready);
+    readyRef.current = ready;
+    const mountedRef = useRef(true);
     const [query, setQuery] = useState('');
     const [activeKey, setActiveKey] = useState<string | null>(null);
     const [fallbackChannels, setFallbackChannels] = useState([] as any[]);
@@ -128,10 +161,13 @@ export function CommandPalette() {
 
     // ⌘K / Ctrl+K anywhere. Capture phase so a focused editor can't swallow it.
     useEffect(() => {
+        mountedRef.current = true;
         const onKey = (e: any) => {
             if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === 'k') {
                 e.preventDefault();
                 setOpen((v: any) => !v);
+            } else if (e.key === 'Escape' && !readyRef.current) {
+                setOpen(false);
             }
         };
         // WebKit emits stationary mousemoves when results move under the pointer.
@@ -143,6 +179,7 @@ export function CommandPalette() {
         document.addEventListener('keydown', onKey, true);
         document.addEventListener('mousemove', onMouseMove, true);
         return () => {
+            mountedRef.current = false;
             document.removeEventListener('keydown', onKey, true);
             document.removeEventListener('mousemove', onMouseMove, true);
         };
@@ -172,7 +209,7 @@ export function CommandPalette() {
             })
             .catch(() => { /* the palette is still useful without channels */ });
         return () => { cancelled = true; };
-    }, [open, templateContext]); // eslint-disable-line react-hooks/exhaustive-deps -- read once per opening/context, not when the response changes fallbackChannels
+    }, [open, templateContext, permissions]); // eslint-disable-line react-hooks/exhaustive-deps -- recheck access on permission changes; do not refetch when the response changes fallbackChannels
 
     useEffect(() => { if (open) { setQuery(''); setActiveKey(null); } }, [open]);
 
@@ -197,7 +234,7 @@ export function CommandPalette() {
         const off = platform.events.on('codeTemplateLibraries:associationsSaved', refresh);
         refresh();
         return () => { request++; off(); };
-    }, [open, channelContext, templateContext]);
+    }, [open, channelContext, templateContext, permissions]);
 
     const libraries = templateContext ? context.libraries : fetchedLibraries;
     const channels = useMemo(() => {
@@ -225,12 +262,14 @@ export function CommandPalette() {
 
     const suggested = useMemo(() => open
         ? contextSuggestions(context, channels, libraries, checkTask).slice(0, MAX_SUGGESTED) : [],
-    [open, context, channels, libraries]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- the controller reads its permission snapshot outside React
+    [open, context, channels, libraries, permissions]);
 
     const entries = useMemo(
         () => (open ? [...viewEntries(), ...commandEntries(), ...channelPaletteEntries(channels, checkTask),
             ...templatePaletteEntries(libraries, checkTask)] : []),
-        [open, channels, libraries]
+        // eslint-disable-next-line react-hooks/exhaustive-deps -- the controller reads its permission snapshot outside React
+        [open, channels, libraries, permissions]
     );
 
     const results = useMemo(() => {
@@ -273,13 +312,13 @@ export function CommandPalette() {
     useEffect(() => { setActiveKey(null); }, [query]);
 
     const run = useCallback((entry: any) => {
-        if (!entry || !entryAllowed(entry, checkTask)) return;
+        if (!mountedRef.current || !readyRef.current || !entry || !permitted(entry)) return;
         setOpen(false);
         const recent = [entry.id, ...(getPref('paletteRecent') || []).filter((id: any) => id !== entry.id)];
         setPrefs({ paletteRecent: recent.slice(0, MAX_RECENT) });
         // After the dialog has closed, so focus restore doesn't fight the view swap.
         setTimeout(() => {
-            if (!entryAllowed(entry, checkTask)) return;
+            if (!mountedRef.current || !readyRef.current || !permitted(entry)) return;
             if (entry.run) entry.run();
             else if (entry.path) router.navigate(entry.path);
         }, 0);

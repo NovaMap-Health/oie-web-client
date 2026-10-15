@@ -31,7 +31,8 @@ import { getPref, setPrefs, resetPrefs, PREF_DEFAULTS, DASHBOARD_REFRESH_SECONDS
 import { checkImportVersionFromDoc } from '../../core/import-guard.js';
 import { setTheme, setTableDensity, setFontUi, setFontMono, FONT_UI_OPTIONS, FONT_MONO_OPTIONS, getState, setState } from '../../core/store.js';
 import { ViewTasks, mountReact } from '../mount.jsx';
-import { applyEnvironmentColor, environmentColorVars, darkSurfaceTint, parseColorPref, serializeColorPref } from '../bridges.jsx';
+import { canViewSettingsTab, settingsTabId } from '../../core/settings-navigation.js';
+import { useStoreKey, applyEnvironmentColor, environmentColorVars, darkSurfaceTint, parseColorPref, serializeColorPref } from '../bridges.jsx';
 import { PluginSlot } from '../plugin-slot.jsx';
 import { AccessDeniedView } from '../access-denied.jsx';
 import * as TabsPrimitive from '@radix-ui/react-tabs';
@@ -1863,7 +1864,7 @@ const BUILTIN_TABS = [
     // below via platform.settingsPanels().
 ];
 
-// Build the full tab list once: built-ins + plugin-contributed settings panels
+// Build the full tab list: built-ins + plugin-contributed settings panels
 // (Data Pruner). A plugin panel renders into the tab host via panel.render(host,
 // ctx); if it returns a detached Node, append it (matching the vanilla shell).
 function buildTabDefs(plat: any) {
@@ -1873,10 +1874,7 @@ function buildTabDefs(plat: any) {
     // from everyone but Manage Roles holders, which locked viewers out entirely
     // (and made a missing is_admin assignment look like a permissions
     // chicken-and-egg).
-    const visible = (label: string) => {
-        const taskGroup = `settings_${label}`;
-        return plat.checkTask(taskGroup, 'doRefresh') || plat.checkTask(taskGroup, 'doSave');
-    };
+    const visible = (label: string) => canViewSettingsTab(plat, label);
     // The SAME gate for the built-in tabs. They were appended unconditionally,
     // so a role without viewServerSettings still got a Server tab whose first
     // request answered "Missing permission: viewServerSettings" in an error
@@ -1934,11 +1932,12 @@ function promptSaveSettings(canSave?: any) {
 // Mounts the active tab's legacy builder once and tracks its declared task pane.
 // The builder's setTasks(title, items) writes into tasksRef; notify() forces a
 // re-render so the portaled <RailPane> reflects the new title + buttons.
-function SettingsTab({ def, ctx }: any) {
+function SettingsTab({ def, activate }: any) {
     const ref = useRef<any>(null);
     useEffect(() => {
         const host = ref.current;
         if (!host) return;
+        const { ctx, dispose } = activate();
         host.replaceChildren();
         ctx.setSave(null);               // reset; the builder re-registers its own save
         const node = def.render(ctx);
@@ -1950,6 +1949,9 @@ function SettingsTab({ def, ctx }: any) {
         host.addEventListener('input', onEdit);
         host.addEventListener('change', onEdit);
         return () => {
+            // Invalidate first: a plugin's teardown or late async completion can
+            // still call the ctx it received, but it no longer owns this view.
+            dispose();
             host.removeEventListener('input', onEdit);
             host.removeEventListener('change', onEdit);
             if (node && node.__teardown) node.__teardown();
@@ -1991,8 +1993,9 @@ function TasksPane({ title, items, ...paneProps }: any) {
 }
 
 export function SettingsView({ query }: any) {
-    // Tab defs (built-ins + plugin panels) are stable for the view's lifetime.
-    const [defs] = useState(() => buildTabDefs(platform));
+    // Permissions and plugin panels can recover while Settings remains mounted.
+    useStoreKey('webPlugins');
+    const defs = buildTabDefs(platform);
     // A direct URL can reach Settings even when every tab is denied (including
     // when the permission service fails closed). Do not mount tab/task/dirty
     // state until there is a tab: none of its builders should run in this case.
@@ -2006,11 +2009,13 @@ function SettingsContent({ query, defs }: any) {
     // Deep-link: /settings?tab=<label> opens that tab (e.g. the account menu's
     // "Settings" → Administrator preferences). Unknown/absent → the first tab
     // this role can see (Server for an administrator).
-    const [active, setActive] = useState(() => {
-        const want = String(query?.tab || '').trim().toLowerCase();
-        const i = want ? defs.findIndex((d: any) => d.label.toLowerCase() === want) : -1;
-        return i >= 0 ? i : 0;
+    const [selectedLabel, setSelectedLabel] = useState(() => {
+        const want = settingsTabId(String(query?.tab || ''));
+        return defs.find((d: any) => settingsTabId(d.label) === want)?.label || defs[0]?.label || '';
     });
+    // Labels remain stable when a recovered panel changes the tab ordering.
+    const def = defs.find((d: any) => d.label === selectedLabel) || defs[0];
+    const active = def?.label || '';
     const [dirty, setDirtyState] = useState(false);   // drives the unsaved-tab indicator
     const [, force] = useReducer((x: any) => x + 1, 0);
     // The active tab's declared task pane (title + legacy DOM items).
@@ -2019,6 +2024,9 @@ function SettingsContent({ query, defs }: any) {
     useEffect(() => registerUnsavedCheck(() => dirtyRef.current), []);
     const saveRef = useRef<any>(null);   // the active tab's save(), if it supports saving
     const activeLabelRef = useRef<any>(null);   // active tab label, for its settings_<Tab> RBAC group
+    // A label can disappear and return while a prompt/save is pending. Only the
+    // exact mounted activation owns its callbacks and may approve navigation.
+    const activationRef = useRef<object | null>(null);
 
     // setTasks is what each legacy builder calls; it captures the task spec and
     // forces a re-render of the portaled pane. ctx mirrors the vanilla shell ctx,
@@ -2028,10 +2036,16 @@ function SettingsContent({ query, defs }: any) {
         function refreshGuard() {
             if (dirtyRef.current) {
                 setState('navGuard', async () => {
+                    const source = activationRef.current;
+                    if (!source) return false;
+                    const label = activeLabelRef.current;
                     const choice = await promptSaveSettings(
-                        platform.checkTask(`settings_${activeLabelRef.current}`, 'doSave'));
+                        platform.checkTask(`settings_${label}`, 'doSave'));
                     if (choice === 'cancel') return false;
-                    if (choice === 'save' && saveRef.current && (await saveRef.current()) === false) return false;
+                    if (activationRef.current !== source) return false;
+                    if (choice === 'save' && (!platform.checkTask(`settings_${label}`, 'doSave')
+                        || !saveRef.current || (await saveRef.current()) === false)) return false;
+                    if (activationRef.current !== source) return false;
                     setClean();
                 });
             } else {
@@ -2046,16 +2060,33 @@ function SettingsContent({ query, defs }: any) {
         function setClean() {
             dirtyRef.current = false; setDirtyState(false); setState('navGuard', null);
         }
-        return {
+        const context = {
             platform,
             setTasks(title: any, items: any) { tasksRef.current = { title, items }; force(); },
             markDirty: setDirty,
             markClean: setClean,
             setSave(fn: any) { saveRef.current = fn || null; }
         };
+        return {
+            ...context,
+            activate() {
+                const token = {};
+                activationRef.current = token;
+                const current = () => activationRef.current === token;
+                return {
+                    ctx: {
+                        platform,
+                        setTasks(title: any, items: any) { if (current()) context.setTasks(title, items); },
+                        markDirty() { if (current()) context.markDirty(); },
+                        markClean() { if (current()) context.markClean(); },
+                        setSave(fn: any) { if (current()) context.setSave(fn); }
+                    },
+                    dispose() { if (current()) activationRef.current = null; }
+                };
+            }
+        };
     });
 
-    const def = defs[active] || defs[0];
 
     /* Tab-switch guard: prompt if the current tab has unsaved changes.
 
@@ -2064,26 +2095,33 @@ function SettingsContent({ query, defs }: any) {
        moved — so the second event proposes the same switch and would open a second
        dialog. (A fast double-click could have done the same before Radix.) One
        pending prompt at a time. */
-    const switchingRef = useRef(false);
-    async function requestTab(i: any) {
-        if (i === active || switchingRef.current) return;
-        switchingRef.current = true;
+    const switchingRef = useRef<object | null>(null);
+    async function requestTab(label: string) {
+        const source = activationRef.current;
+        if (label === active || !source || switchingRef.current === source) return;
+        switchingRef.current = source;
         try {
-            await performTabSwitch(i);
+            await performTabSwitch(label);
         } finally {
-            switchingRef.current = false;
+            if (switchingRef.current === source) switchingRef.current = null;
         }
     }
 
-    async function performTabSwitch(i: any) {
+    async function performTabSwitch(label: string) {
+        const source = activationRef.current;
+        if (!source) return;
+        const sourceLabel = activeLabelRef.current;
         if (dirtyRef.current) {
             const choice = await promptSaveSettings(
-                platform.checkTask(`settings_${activeLabelRef.current}`, 'doSave'));
+                platform.checkTask(`settings_${sourceLabel}`, 'doSave'));
             if (choice === 'cancel') return;
-            if (choice === 'save' && saveRef.current && (await saveRef.current()) === false) return;
+            if (activationRef.current !== source) return;
+            if (choice === 'save' && (!platform.checkTask(`settings_${sourceLabel}`, 'doSave')
+                || !saveRef.current || (await saveRef.current()) === false)) return;
         }
+        if (activationRef.current !== source || !buildTabDefs(platform).some((d: any) => d.label === label)) return;
         ctx.markClean();
-        setActive(i);
+        setSelectedLabel(label);
     }
 
     // Radix Tabs is CONTROLLED here: onValueChange only proposes. requestTab may
@@ -2096,12 +2134,23 @@ function SettingsContent({ query, defs }: any) {
     const shownRef = useRef(active);
     if (shownRef.current !== active) {
         shownRef.current = active;
-        tasksRef.current = { title: `${def.label} Tasks`, items: [] };
+        activationRef.current = null;
+        tasksRef.current = { title: def ? `${def.label} Tasks` : 'Settings Tasks', items: [] };
+        saveRef.current = null;
     }
-    activeLabelRef.current = def.label;
+    activeLabelRef.current = active;
+    useEffect(() => {
+        // Clear a removed selection so later recovery cannot unexpectedly replace
+        // a draft on the fallback tab. Surviving tabs keep their mounted editor.
+        if (selectedLabel !== active) setSelectedLabel(active);
+        if (!active) ctx.markClean();
+    }, [active, selectedLabel, ctx]);
 
     // Drop the leave-guard when the settings view itself unmounts.
-    useEffect(() => () => { setState('navGuard', null); }, []);
+    useEffect(() => () => {
+        activationRef.current = null;
+        setState('navGuard', null);
+    }, []);
 
     const { title, items } = tasksRef.current;
 
@@ -2112,20 +2161,21 @@ function SettingsContent({ query, defs }: any) {
             </ViewTasks>
             <div className="view-body flush flex flex-col">
                 <TabsPrimitive.Root value={String(active)}
-                    onValueChange={(v: any) => requestTab(Number(v))}
+                    onValueChange={requestTab}
                     className="tabs-wrap flex flex-col flex-1 min-h-0 overflow-hidden">
                     <TabsPrimitive.List className="tabs" aria-label="Settings sections">
-                        {defs.map((d: any, i: any) => (
-                            <TabsPrimitive.Trigger key={d.label} value={String(i)}
-                                className={'tab' + (i === active ? ' active' : '')}>
-                                {d.label}{i === active && dirty ? ' ●' : ''}
+                        {defs.map((d: any) => (
+                            <TabsPrimitive.Trigger key={d.label} value={d.label}
+                                className={'tab' + (d.label === active ? ' active' : '')}>
+                                {d.label}{d.label === active && dirty ? ' ●' : ''}
                             </TabsPrimitive.Trigger>
                         ))}
                     </TabsPrimitive.List>
                     <TabsPrimitive.Content value={String(active)} className="tab-body flex flex-col flex-1 min-h-0">
                         {/* Only the active tab is mounted; keyed by label so switching
                             tabs remounts (and reloads) it, matching vanilla tabs(). */}
-                        <SettingsTab key={def.label} def={def} ctx={ctx} />
+                        {def ? <SettingsTab key={def.label} def={def} activate={ctx.activate} />
+                            : <div className="dt-empty">No settings are available with your current permissions.</div>}
                     </TabsPrimitive.Content>
                 </TabsPrimitive.Root>
             </div>

@@ -11,7 +11,7 @@
  *
  * A command is the same shape as a nav item, so the palette can treat both alike:
  *
- *   { id, label, icon?, section?, order?, keywords?, task?, rbac?, permissions?, path?, run? }
+ *   { id, label, icon?, section?, order?, keywords?, task?, rbac?, permissions?, visible?, path?, run? }
  *
  * `path` navigates; `run` is called instead when present. `task` + `rbac` are the
  * authorization pair the task panes and popup menus already use — the palette
