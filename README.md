@@ -394,10 +394,28 @@ in the About dialog, startup banner, and `/webadmin/config.json`; nothing derive
 it from the tag. Keep the monorepo release version synchronized so tooling and
 the application identify the same release.
 
-Pushing a `v*` tag also publishes `oie-webadmin.war` as a GitHub Release asset.
-The Web Support release pipeline consumes the version declared by its
-`webclient.version` build property and records this repository's resolved tag and
-the WAR SHA-256 in its own release notes.
+Before tagging, update the pinned Web Support commit and package filename in
+[CI](.github/workflows/ci.yml) to the coordinated companion release candidate.
+Require passing checks on the final accumulated change: the older PR checks
+do not validate later changes merged into `main`. The release jobs build and
+verify the Node runtime and WAR once, exercise them in browsers and isolated
+OIE 4.6.0 installations with and without Web Support, and test both Docker
+architectures before publication. Upgrade/rollback CI uses the pinned 0.9.0
+baseline; it does not claim to exercise every intervening release.
+
+Add release notes at `docs/releases/vX.Y.Z.md`. When creating a new release,
+the publisher uses that file; an existing draft keeps its edited notes.
+The GitHub assets are `oie-webadmin.war`, `oie-webadmin-node.tar.gz`, their
+individual `.sha256` files, and `release-receipt.json` recording the source
+commit, version and artifact hashes.
+
+Publish the Web Client first and wait for its complete release assets before
+tagging Web Support. Its release pipeline consumes the client version declared
+by `webclient.version`, verifies the WAR checksum and receipt against the client
+tag, signs the plugin JAR, and checks the bundled WAR remains byte-identical.
+The signed `websupport-X.Y.Z.zip` and `SHA256SUMS` are then published, followed
+by the automated community-catalog PR. For the coordinated 1.1.0 release, use
+[Web Client 1.1.0 notes](docs/releases/v1.1.0.md) and Web Support 1.1.0.
 
 Git supplies only the build *metadata* beside it (commit, build date, and a
 `dirty` flag when the tree had uncommitted changes), stamped into a gitignored
@@ -405,10 +423,24 @@ Git supplies only the build *metadata* beside it (commit, build date, and a
 build pass the commit in as a build arg, since `.git` is never in the image
 context.
 
-So a release is: bump the versions, commit, tag `vX.Y.Z`, and push the tag. The
-Docker workflow cuts `X.Y.Z` / `X.Y` image tags from it and moves `latest` only
-for a non-prerelease semantic-version tag; the separate `main` tag tracks the
-branch tip.
+Merge the validated version and release-preparation changes, tag that exact
+commit `vX.Y.Z`, and push the tag. The Docker workflow cuts `X.Y.Z` / `X.Y`
+image tags from it and moves `latest` only for a non-prerelease semantic-version
+tag; the separate `main` tag tracks the branch tip. Docker promotion precedes
+GitHub asset publication, so a failure can leave published images while the
+GitHub release is still a draft or absent.
+
+For a failed Web Client publication, rerun only the failed jobs so they reuse
+the tested `release-inputs` artifact. Existing assets must compare byte-for-byte;
+they are never overwritten. Rebuilding the whole workflow can produce different
+archive bytes and fail that comparison. Keep the original run artifacts until
+publication is complete. Web Support retains its signed ZIP, checksum and
+receipt in `signed-release-assets`; retry its failed publication job using those
+original bytes. Its publisher also refuses to replace differing existing assets,
+including a ZIP rebuilt or re-signed by a complete workflow rerun. If only the
+catalog failed, retry that job or dispatch its catalog workflow for the existing
+tag; verify the catalog digest against the final published ZIP before merging
+the catalog PR.
 
 ### Docker tag cleanup
 

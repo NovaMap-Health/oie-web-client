@@ -25,12 +25,18 @@ jobs:
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             extra=()
             [[ "$TAG" != *-* ]] || extra+=(--prerelease)
-            gh release create "$TAG" --verify-tag --draft --title "$TAG" \
-              --notes "Deployment options:
+            notes="docs/releases/$TAG.md"
+            if [ -f "$notes" ]; then
+              extra+=(--notes-file "$notes")
+            else
+              extra+=(--notes "Deployment options:
 
           - oie-webadmin.war: embedded OIE deployment
-          - gibson9583/oie-web-client: Docker deployment
-          - repository source: standalone Node.js deployment" "${extra[@]}"
+          - oie-webadmin-node.tar.gz: standalone Node.js deployment
+          - gibson9583/oie-web-client: Docker deployment")
+            fi
+            gh release create "$TAG" --verify-tag --draft --title "$TAG" \
+              "${extra[@]}"
           fi
           mkdir existing
           for file in release-artifacts/*; do

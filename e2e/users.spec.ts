@@ -184,6 +184,98 @@ test('Edit User saves the password before the profile and retries cleanly', asyn
     expect(passwords).toBe(2);
 });
 
+// A password write can commit before its response reaches the browser. Match
+// that engine contract and exercise the shared dialog through both entry points.
+for (const self of [false, true]) {
+    for (const outcome of ['unchanged', 'policy rejection', 'accepted replacement', 'lost response', 'failed response', 'lost response with history'] as const) {
+        test(`Edit ${self ? 'Account' : 'User'} retries partial saves after ${outcome}`, async ({ page }) => {
+            const id = self ? 1 : 2;
+            const passwordA = 'FirstAcceptedPassword1!';
+            const passwordB = 'ReplacementPassword2!';
+            const passwordC = 'FreshRecoveryPassword3!';
+            const history = outcome === 'lost response with history';
+            const accepted = new Set<string>();
+            const writes: string[] = [];
+            let savedPassword = 'OriginalPassword';
+            let profiles = 0;
+            const failedProfiles = outcome === 'accepted replacement' ? 2 : 1;
+            await mockEngine(page, {
+                [`PUT /users/${id}`]: () => ++profiles <= failedProfiles
+                    ? { __status: 500, body: { message: 'Profile temporarily unavailable' } } : '',
+            });
+            await page.route(`**/api/users/${id}/password`, async route => {
+                const value = route.request().postData() || '';
+                writes.push(value);
+                if (value === passwordB && outcome === 'policy rejection') {
+                    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ list: { string: ['Password violates policy'] } }) });
+                }
+                if (accepted.has(value) && (history || outcome === 'unchanged' || outcome === 'policy rejection' || outcome === 'accepted replacement')) {
+                    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ list: { string: ['Password was recently used'] } }) });
+                }
+                if (value === passwordB && outcome === 'failed response') {
+                    return route.fulfill({ status: 503, body: 'Password service temporarily unavailable' });
+                }
+                savedPassword = value;
+                accepted.add(value);
+                if (value === passwordB && outcome.startsWith('lost response')) return route.abort('connectionreset');
+                return route.fulfill({ status: 200, body: '' });
+            });
+            if (self) {
+                await page.goto('/');
+                await page.locator('button.user-chip').click();
+                await page.getByRole('menuitem', { name: 'Edit Account', exact: true }).click();
+            } else {
+                await openEditUser(page);
+            }
+            const dialog = page.getByRole('dialog', { name: /Edit User/ });
+            const error = page.getByRole('dialog', { name: 'Error', exact: true });
+            const fields = dialog.locator('input[type=password]');
+            const fill = async (value: string) => { await fields.nth(0).fill(value); await fields.nth(1).fill(value); };
+            const save = () => dialog.getByRole('button', { name: 'Save', exact: true }).click();
+            const dismissError = () => error.getByRole('button', { name: 'Close', exact: true }).last().click();
+            await fill(passwordA);
+            await save();
+            await expect(error).toContainText('Profile temporarily unavailable');
+            await dismissError();
+            await expect(dialog.getByRole('status')).toContainText('Password saved.');
+            expect(profiles).toBe(1);
+
+            if (outcome !== 'unchanged') {
+                await fill(passwordB);
+                await save();
+                await expect(error).toBeVisible();
+                if (outcome === 'policy rejection') await expect(error).toContainText('Password violates policy');
+                await dismissError();
+                if (outcome.startsWith('lost response') || outcome === 'failed response') {
+                    await expect(dialog.getByRole('status')).toBeEmpty();
+                }
+                expect(profiles).toBe(outcome === 'accepted replacement' ? 2 : 1);
+            }
+
+            const finalPassword = outcome === 'accepted replacement' ? passwordB : passwordA;
+            await fill(finalPassword);
+            await save();
+            if (history) {
+                // A was accepted before the ambiguous B write, but can no
+                // longer be treated as current. History must block completion.
+                await expect(error).toContainText('Password was recently used');
+                expect(profiles).toBe(1);
+                expect(savedPassword).toBe(passwordB);
+                await dismissError();
+                await expect(dialog.getByRole('status')).toBeEmpty();
+                await fill(passwordC);
+                await save();
+            }
+            await expect(dialog).toHaveCount(0);
+            expect(savedPassword).toBe(history ? passwordC : finalPassword);
+            expect(profiles).toBe(failedProfiles + 1);
+            expect(writes).toEqual(outcome === 'unchanged' ? [passwordA]
+                : outcome === 'policy rejection' || outcome === 'accepted replacement' ? [passwordA, passwordB]
+                    : history ? [passwordA, passwordB, passwordA, passwordC] : [passwordA, passwordB, passwordA]);
+        });
+    }
+}
+
 test('Save and Create stay disabled until the required fields are filled, like Swing', async ({ page }) => {
     await mockEngine(page);
     await openNewUser(page);

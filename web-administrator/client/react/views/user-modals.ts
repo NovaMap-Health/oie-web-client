@@ -161,10 +161,20 @@ export function openEditUserModal(user: any, { onSaved }: any = {}) {
                         toast('If you are changing your username, you must also update your password.', 'warn');
                         return false;
                     }
+                    progress.textContent = '';
                     try {
                         if (password && acceptedPassword !== password) {
+                            const previousPassword = acceptedPassword;
+                            // The engine can save a replacement before its response
+                            // is lost. Only a definite policy rejection proves the
+                            // previously accepted password is still current.
+                            acceptedPassword = null;
                             const violations = passwordViolations(await api.users.updatePassword(user.id, password));
-                            if (violations.length) { toast(passwordRejectedMessage(violations), 'error'); return false; }
+                            if (violations.length) {
+                                acceptedPassword = previousPassword;
+                                toast(passwordRejectedMessage(violations), 'error');
+                                return false;
+                            }
                             acceptedPassword = password;
                         }
                         const submitted = { ...user };
