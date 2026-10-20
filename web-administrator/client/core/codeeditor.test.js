@@ -35,6 +35,32 @@ class Element extends EventTarget {
 const editorBody = source.slice(source.indexOf('export class CodeEditor'), source.indexOf('/* Insert text')).replace('export class', 'class');
 const Editor = new Function('h', `${editorBody}\nreturn CodeEditor;`)(() => new Element());
 
+test('the factory requests only the editor language and carries it through the delayed upgrade', async () => {
+    for (const language of [undefined, 'javascript', 'sample-plugin']) {
+        const loaded = Promise.resolve({});
+        let requested, mounted;
+        const factory = new Function('CodeEditor', 'ensureMonaco', 'mountMonaco',
+            `${factoryBody}\nreturn factory;`)(Editor, value => { requested = value; return loaded; },
+            (_monaco, _editor, options) => { mounted = options.language; });
+        factory({ language });
+        await loaded;
+        assert.equal(requested, language);
+        assert.equal(mounted, language);
+    }
+});
+
+test('fallback honors plugin indentation in standard and literal input modes', () => {
+    for (const literalInput of [false, true]) {
+        for (const tabSize of [2, 4, 8]) {
+            const editor = new Editor({ language: 'sample-plugin', value: '', literalInput, tabSize, insertSpaces: true });
+            editor.handleKey({ key: 'Tab', preventDefault() {} });
+            assert.equal(editor.getValue(), ' '.repeat(tabSize));
+            editor.handleKey({ key: 'Tab', shiftKey: true, preventDefault() {} });
+            assert.equal(editor.getValue(), '');
+        }
+    }
+});
+
 for (const [name, literalInput, events, disposed, available, expected] of [
     ['untouched template upgrades', true, [], false, true, 1],
     ['edited template keeps its textarea', true, ['insertText'], false, true, 0],

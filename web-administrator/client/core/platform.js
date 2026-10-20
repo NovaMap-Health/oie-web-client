@@ -6,7 +6,9 @@
  * plugins use, so a plugin can do anything a built-in view can. The plugin
  * entry module (declared in plugin.json → client.entry) must export:
  *
- *   export function register(platform) { ... }
+ *   export function register(platform, context) { ... }
+ *
+ * The optional context reads plugin-owned text assets from their manifest root.
  *
  * Extension points (mirroring com.mirth.connect.plugins.* on the Swing side):
  *   registerNavItem        — left rail entry             (ClientPlugin task panes)
@@ -18,6 +20,7 @@
  *   registerAttachmentViewer — message attachment viewer (AttachmentViewer)
  *   registerChannelAction  — Channels view row action    (ChannelPanelPlugin task)
  *   registerCodeTemplateAction — Code Templates row action
+ *   registerCodeTemplateType — code-template properties and editor
  *   registerMessageAction  — message browser row action  (web-only; Swing has no hook)
  *   registerReferences     — Reference list + autocomplete entries (CodeTemplatePlugin)
  *   registerStepType / registerRuleType — transformer/filter editors
@@ -38,11 +41,13 @@ import { registerLoginAuthenticator } from './login-auth.js';
 import * as columns from './columns.js';
 import { createCodeEditor, setCodeEditorFactory } from './codeeditor.js';
 import { createDiffEditor } from './diffeditor.js';
+import { registerEditorLanguage } from './editor-languages.js';
+import { createPluginContext } from './plugin-assets.js';
 import { setAuthorizationController, checkTask, blockAuthorization, beginAuthorizationDiscovery, beginAuthorizationRegistration, authorizationRegistration } from './authorization.js';
 import { registerIcon } from './icons.js';
 import { registerCommand } from './commands.js';
 import { apiUrl, appUrl } from './deployment.js';
-import { addReferences, registeredReferences } from './script-completions.js';
+import { addReferences, registeredReferences, registerTemplateCompletionSource } from './script-completions.js';
 /* ---- @oie/* plugin API contract version --------------------------------------
  * The version of the framework surface (the `platform` registries + the @oie/web-*
  * exports) that this web admin implements. Tracks the OIE engine release line it
@@ -57,7 +62,7 @@ import { addReferences, registeredReferences } from './script-completions.js';
  * plugin built for 4.6 keeps working on 4.7, 4.9, … (older APIs never removed
  * within a major); it's rejected only when THIS web admin is too old (its apiMin
  * is newer than us) or a major bump dropped what it relies on. */
-export const OIE_API_VERSION = '4.9.0'; // 4.9: command availability and required authorization providers
+export const OIE_API_VERSION = '4.10.0'; // 4.10: plugin code-template types and on-demand editor languages
 function parseApiVersion(v) {
     const [major, minor] = String(v == null ? '' : v).split('.');
     return { major: parseInt(major, 10) || 0, minor: parseInt(minor, 10) || 0 };
@@ -79,6 +84,7 @@ const registries = {
     channelTabs: [],
     channelActions: [],
     codeTemplateActions: [],
+    codeTemplateTypes: new Map(),
     messageActions: [],
     settingsPanels: [],
     attachmentViewers: [],
@@ -117,6 +123,7 @@ export const platform = {
     events: { on: store.on, emit: store.emit },
     createCodeEditor,
     setCodeEditorFactory,
+    registerEditorLanguage,
     // Read-only side-by-side diff viewer backed by the host's single Monaco
     // instance (core/diffeditor.ts). Plugins showing diffs use this so they
     // never bundle their own Monaco. Degrades to a plain two-pane view.
@@ -157,6 +164,22 @@ export const platform = {
        isEnabled?(ctx) → bool, onInvoke(template, ctx) }.
        ctx = { platform, template, library }. */
     registerCodeTemplateAction(action) { registries.codeTemplateActions.push(action); },
+    registerCodeTemplateType(id, def) {
+        if (!id || ['FUNCTION', 'COMPILED_CODE', 'DRAG_AND_DROP_CODE'].includes(id)
+            || !def.label || !def.propertiesClass
+            || def.propertiesClass === 'com.mirth.connect.model.codetemplates.BasicCodeTemplateProperties'
+            || typeof def.create !== 'function' || typeof def.component !== 'function') {
+            throw new Error('Code template types require a unique id, properties class, label, create function, and component');
+        }
+        if (registries.codeTemplateTypes.has(id)
+            || [...registries.codeTemplateTypes.values()].some(type => type.propertiesClass === def.propertiesClass)) {
+            throw new Error(`Code template type is already registered: ${id}`);
+        }
+        registries.codeTemplateTypes.set(id, def);
+        if (def.getCompletionCode)
+            registerTemplateCompletionSource(def.propertiesClass, template => def.getCompletionCode({ template, properties: template.properties, platform }));
+        store.emit('codeTemplateTypes:changed');
+    },
     /* A per-message action, shown in the message browser's row right-click menu
        and, for the selected row, in the Message Tasks pane. Web-only: Swing's
        MessageBrowser has no plugin hook. def = { id, label, icon?, order?,
@@ -201,6 +224,7 @@ export const platform = {
     channelTabs: () => sorted(registries.channelTabs),
     channelActions: () => sorted(registries.channelActions),
     codeTemplateActions: () => sorted(registries.codeTemplateActions),
+    codeTemplateTypes: () => new Map([...registries.codeTemplateTypes].sort(([, a], [, b]) => (a.order ?? 100) - (b.order ?? 100))),
     messageActions: () => sorted(registries.messageActions),
     references: () => registeredReferences(),
     settingsPanels: () => sorted(registries.settingsPanels),
@@ -279,6 +303,7 @@ async function fetchEngineManifests() {
                 apiMin: m.oie && m.oie.apiMin ? String(m.oie.apiMin) : null,
                 entry,
                 source: 'engine',
+                assetBase: base,
                 authorization: m.authorization === true || m.id === 'rbac' || path === 'rbac'
             };
         }
@@ -360,6 +385,7 @@ async function loadPluginsOnce(assertSession) {
     // and in a WAR context. Turn those into physical app URLs before import().
     manifests = manifests.map((manifest) => ({
         ...manifest,
+        assetBase: appUrl(`/plugins/${encodeURIComponent(manifest.id)}`),
         entry: manifest.entry && manifest.entry.startsWith('/plugins/')
             ? appUrl(manifest.entry)
             : manifest.entry
@@ -458,7 +484,7 @@ async function loadPluginsOnce(assertSession) {
         if (typeof module.register === 'function') {
             const before = authorizationRegistration();
             try {
-                await module.register(platform);
+                await module.register(platform, createPluginContext(manifest.assetBase, manifest.source === 'engine', assertSession));
                 assertSession();
                 const after = authorizationRegistration();
                 if (isAuthorization(manifest) && (!after.registered || after.revision === before.revision)) {

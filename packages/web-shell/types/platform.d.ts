@@ -1,6 +1,9 @@
 import { registerLoginAuthenticator } from './login-auth.js';
 import { createCodeEditor, setCodeEditorFactory } from './codeeditor.js';
 import { createDiffEditor } from './diffeditor.js';
+import { registerEditorLanguage } from './editor-languages.js';
+export type { EditorLanguageProvider, EditorLanguageDefinition } from './editor-languages.js';
+export type { PluginContext } from './plugin-assets.js';
 import { setAuthorizationController, checkTask } from './authorization.js';
 import type { Command } from './commands.js';
 import type { OieObject } from './wire-types.js';
@@ -135,6 +138,58 @@ export interface StepRuleType {
         platform: Platform;
     }>;
     [key: string]: any;
+}
+/** A custom properties class backed by an installed engine plugin. The engine
+ * still executes the JavaScript returned by that class's getCode(); this hook
+ * does not add a language compiler to the engine. Added in API 4.10. */
+export interface CodeTemplateType {
+    label: string;
+    propertiesClass: string;
+    order?: number;
+    /** Allowed ContextType names. Omit for all contexts. Existing unsupported
+     * selections are preserved and reported by validation, never silently lost. */
+    contexts?: string[];
+    /** Return fresh properties with one of the engine's existing type values:
+     * FUNCTION, COMPILED_CODE, or DRAG_AND_DROP_CODE. The host sets @class and
+     * supplies @version when absent. Source fields belong to the plugin. */
+    create(ctx: {
+        version: string;
+        template: OieObject;
+    }): OieObject;
+    /** Mutate properties, then call onChange(). Honor readOnly, including in
+     * asynchronous callbacks. Use platform.React and the host code editor. */
+    component: PluginComponent<{
+        template: OieObject;
+        properties: OieObject;
+        onChange(): void;
+        readOnly: boolean;
+        platform: Platform;
+    }>;
+    /** Explicit Validate action: null means valid, a string describes a failure.
+     * Receives a snapshot; custom source is never sent to the JavaScript validator.
+     * Omit when this plugin cannot validate independently of deployment. */
+    validate?(ctx: {
+        template: OieObject;
+        properties: OieObject;
+        platform: Platform;
+    }): string | null | Promise<string | null>;
+    /** Synchronous schema checks before save/import and explicit validation.
+     * Return null or an error string. Do not require runtime availability or
+     * reject incomplete source drafts; execution validation belongs in validate. */
+    validateSave?(ctx: {
+        template: OieObject;
+        properties: OieObject;
+        platform: Platform;
+    }): string | null;
+    /** Synchronous declaration-only JavaScript for script autocomplete and the
+     * Monaco language service. Return a function stub (with optional JSDoc),
+     * never plugin-language source or executable runtime code. Receives a template snapshot;
+     * missing/invalid results and provider failures contribute no completions. */
+    getCompletionCode?(ctx: {
+        template: OieObject;
+        properties: OieObject;
+        platform: Platform;
+    }): string | null;
 }
 export interface ConnectorPanel {
     defaults(version: string): OieObject;
@@ -280,7 +335,7 @@ export interface PluginManifest {
     apiMin?: string | null;
     [key: string]: any;
 }
-export declare const OIE_API_VERSION = "4.9.0";
+export declare const OIE_API_VERSION = "4.10.0";
 export declare function apiCompatible(provided: string, requiredMin?: string | null): boolean;
 /** The platform handed to every plugin's `register(platform)`. */
 export interface Platform {
@@ -297,6 +352,9 @@ export interface Platform {
     registerLoginAuthenticator: typeof registerLoginAuthenticator;
     createCodeEditor: typeof createCodeEditor;
     setCodeEditorFactory: typeof setCodeEditorFactory;
+    /** Register a plugin-owned language definition, loaded only when requested
+     * by createCodeEditor({ language: id }). Added in API 4.10. */
+    registerEditorLanguage: typeof registerEditorLanguage;
     /** Read-only side-by-side diff viewer backed by the host's single Monaco (degrades to plain panes). */
     createDiffEditor: typeof createDiffEditor;
     /** The shell's own React instance — author plugin components against this so every plugin shares one React (hooks/context work). */
@@ -317,6 +375,7 @@ export interface Platform {
     registerChannelTab(tab: ChannelTab): void;
     registerChannelAction(action: ChannelAction): void;
     registerCodeTemplateAction(action: CodeTemplateAction): void;
+    registerCodeTemplateType(id: string, def: CodeTemplateType): void;
     registerMessageAction(action: MessageAction): void;
     /** Add Reference list and autocomplete entries under `category` — a new category or an existing one such as 'Conversion Functions'. */
     registerReferences(category: string, items: ReferenceItem[]): void;
@@ -335,6 +394,7 @@ export interface Platform {
     channelTabs(): ChannelTab[];
     channelActions(): ChannelAction[];
     codeTemplateActions(): CodeTemplateAction[];
+    codeTemplateTypes(): Map<string, CodeTemplateType>;
     messageActions(): MessageAction[];
     references(): Array<ReferenceItem & {
         category: string;
@@ -355,4 +415,3 @@ export interface Platform {
 }
 export declare const platform: Platform;
 export declare function loadPlugins(): Promise<PluginManifest[]>;
-export {};

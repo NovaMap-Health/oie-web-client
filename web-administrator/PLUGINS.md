@@ -160,6 +160,7 @@ ones are built.
 | `ClientPlugin` adding a task to the Code Templates panel | `simple-channel-history` ("View History") | `registerCodeTemplateAction` — adds a right-click item for a selected code template |
 | *(none — Swing's `MessageBrowser` takes no plugin tasks)* | | `registerMessageAction` — adds a right-click item on a message row + a Message Tasks button for the selected row, with the row's connector in context. Web-only; API `4.7`+ |
 | `CodeTemplatePlugin` (`getReferenceItems`) | `http` (HTTP Listener/Sender Functions), `file` (File Reader Functions) | `registerReferences(category, items)`: adds entries to the filter/transformer Reference list, in a new category or in an existing one such as `Conversion Functions`, and to script autocomplete. Each entry shows only in its `contexts`. API `4.8`+ |
+| `CodeTemplateTypePlugin` | Custom function template | `registerCodeTemplateType(id, definition)`: custom properties class, editor, supported contexts, and optional validation. API `4.10`+; see [code-template contracts](#api-410-plugin-contracts). |
 | `TransformerStepPlugin` / `FilterRulePlugin` | mapper, messagebuilder, javascriptstep, xsltstep, destinationsetfilter, scriptfilestep, iterator; rulebuilder, javascriptrule, scriptfilerule | bundled as the `transformer-steps` web plugin calling `registerStepType` / `registerRuleType` |
 | `AttachmentViewer` | `imageviewer`, `pdfviewer`, `dicomviewer`, `textviewer` | each ships as a web plugin (`plugins/attachment-*`) calling `registerAttachmentViewer`; the message browser picks the first whose `canHandle(attachment)` matches |
 | `ConnectorSettingsPanel` | every connector (tcp, http, file, …) | each ships as a web plugin (`plugins/connector-*`) calling `registerConnectorPanel`; panels live in the shared connector library (`client/connectors/*.js` + `forms.js`). See `plugins/sqs-connector` in the SQS repo for a third-party one |
@@ -232,7 +233,7 @@ export function register() {
 
 The framework surface — the `platform` registries plus the `@oie/web-*` exports —
 is versioned by an **API contract version**, `platform.apiVersion`. Web Administrator
-implements **4.9.0** against OIE **4.6.0**. The API minor can advance independently
+implements **4.10.0** against OIE **4.6.0**. The API minor can advance independently
 when exports are added; it is not the application or engine version. It follows
 major.minor (the patch is ignored for compatibility): the **minor** bumps when the
 surface *grows* (new registry, export or supported descriptor field), the **major** bumps on any *breaking*
@@ -270,6 +271,118 @@ Guidance:
 - For runtime feature-detection, read `platform.apiVersion` directly (import
   `OIE_API_VERSION` / `apiCompatible` from `@oie/web-shell` if you need the raw value
   or the comparison helper).
+
+### API 4.10 plugin contracts
+
+API **4.10.0** adds custom code-template types, lazy editor languages, and plugin
+text assets. Declare `"oie": { "apiMin": "4.10" }` when using these contracts.
+The engine plugin supplies a `CodeTemplateProperties` subclass; its `getCode()`
+still returns JavaScript for the engine's existing compile/deploy pipeline. The
+web contract supplies editing and optional language validation, not an engine
+compiler or a new `CodeTemplateType` enum member.
+
+```ts
+platform.registerCodeTemplateType('example-function', {
+    label: 'Example Function',
+    propertiesClass: 'com.example.ExampleCodeTemplateProperties',
+    contexts: ['SOURCE_FILTER_TRANSFORMER', 'DESTINATION_FILTER_TRANSFORMER'],
+    create: ({ version, template }) => ({
+        '@version': version, type: 'FUNCTION', source: '', functionName: 'example_function'
+    }),
+    component: ({ template, properties, platform, readOnly, onChange }) => {
+        // Return React UI using platform.React. Mutate properties, then call
+        // onChange(). Honor readOnly in inputs and asynchronous callbacks.
+        return null;
+    },
+    validate: async ({ template, properties, platform }) => {
+        // Explicit Validate action only: return null for valid, or an error
+        // string. Throwing reports a failed validation request, never success.
+        return properties.source ? null : 'Enter source';
+    },
+    validateSave: ({ properties }) => properties.functionName ? null : 'Enter a function name',
+    getCompletionCode: ({ properties }) => /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(properties.functionName)
+        ? 'function ' + properties.functionName + '(value) {}' : null
+});
+```
+
+`codeTemplateTypes()` returns the registered types as an ordered Map. IDs and
+properties classes must be unique; built-in IDs/classes cannot be overridden.
+Matching uses the stored `properties.@class`, so a custom `FUNCTION` never opens
+in the default JavaScript editor. `create` receives a template snapshot and must
+return fresh properties with `FUNCTION`, `COMPILED_CODE`, or `DRAG_AND_DROP_CODE`.
+The host supplies `@class` and missing `@version`, preserves plugin fields through
+save/import/export, and retains source and context-selection drafts when switching
+types within the selected template. The first switch to a class uses its defaults
+and filters the current contexts to those it supports. Returning to a class
+restores its draft and context selections; source is never translated between
+languages. The built-in types share one draft and retain the current selections
+when switching between them.
+
+`contexts` is optional. When present it limits new context selections; imported
+unsupported selections remain visible and must be cleared before saving.
+`validate` receives a snapshot and is called only by **Validate Script**, never by
+Save. Structural checks precede it; asynchronous results are discarded after an
+engine/session change, navigation/unmount, template edit/reload, or loss of validation permission.
+Omitting `validate` reports that independent validation is unavailable. Custom
+source is never submitted to the host's JavaScript validator. When a provider is
+unavailable, its template remains read-only with all stored properties preserved.
+
+Optional `validateSave` runs synchronously on a snapshot before save/import writes
+and explicit validation. Return `null` or a descriptive error string. Limit this
+to schema requirements needed for the engine to store the template (such as a
+valid exported function name); source drafts must remain saveable before an
+execution environment is ready. A failure stops the write before any libraries
+or templates are submitted. Missing UI providers still allow lossless imports
+whose engine plugin handles their stored models.
+
+Optional `getCompletionCode` returns synchronous JavaScript declarations for the
+template's callable API, such as a function stub with JSDoc. The host uses these
+for function suggestions, the References list's callable drag text, and Monaco's JavaScript language service while
+preserving library/channel/context scope. It receives a snapshot; returning
+`null`, an invalid result, or throwing excludes only that template's completion.
+Validate exported names before interpolating them. Never return the plugin's
+custom source or runtime implementation. Custom classes without this hook do
+not contribute JavaScript completions; their raw source fields are never used
+as a fallback.
+
+Plugins own their optional language assets. Register a lazy definition with
+`platform.registerEditorLanguage(id, { aliases?, extensions?, load })`; `load`
+returns an `EditorLanguageDefinition` (or a Promise) containing `tokensProvider`
+(Monaco Monarch grammar) and optional `configuration` (Monaco language settings).
+The shared editor loads it only when `platform.createCodeEditor` requests that
+language. Use the host editor and dispose it on unmount. Ordinary JavaScript/Rhino
+editors do not fetch optional plugin grammars. The host owns Rhino/JavaScript
+editing and the existing message/connector formats; optional scripting-language
+grammars belong to their plugins. Language IDs must be unique and cannot replace
+the host's existing languages. A failed load leaves the text editor usable and a
+later editor can retry.
+
+The loader calls `register(platform, context)`; existing single-argument plugins
+remain compatible. Import `PluginContext`, `EditorLanguageProvider`, and
+`EditorLanguageDefinition` types from `@oie/web-shell`. `context.getAssetText(path)`
+reads a text asset relative to the directory containing `plugin.json`, including
+any `web/` prefix. It uses the discovered engine extension path, which may differ
+from the manifest ID, or the bundled `/plugins/<id>` root. This works in Node and
+WAR deployments even when the entry module is imported from a temporary URL.
+
+```ts
+export function register(platform, context) {
+    platform.registerEditorLanguage('example', {
+        aliases: ['Example'], extensions: ['.example'],
+        load: async () => decodeLanguageDefinition(
+            JSON.parse(await context.getAssetText('web/language.json'))
+        )
+    });
+}
+```
+
+`decodeLanguageDefinition` is plugin code: JSON grammars must restore any RegExp
+values required by Monarch. Assets are read as data without evaluating code.
+The host sends authenticated engine requests with `X-Requested-With`, disables
+HTTP caching, and rejects reads after an engine or user-session change, including
+changes while the response body is loading. Reads reject unsuccessful HTTP
+responses. Pass literal relative path segments; absolute URLs, traversal,
+percent-encoded paths, query strings, fragments, and backslashes are rejected.
 
 ### API 4.9 plugin contracts
 
@@ -656,7 +769,7 @@ platform.setAuthorizationController({
 
 | API | Purpose |
 |---|---|
-| `platform.apiVersion` | The `@oie/*` API contract version this web administrator implements — is `"4.9.0"`, independently of the engine version. Read it for runtime feature-detection; declare your minimum via `oie.apiMin` in `plugin.json`. See [API version compatibility](#api-version-compatibility). |
+| `platform.apiVersion` | The `@oie/*` API contract version this web administrator implements — is `"4.10.0"`, independently of the engine version. Read it for runtime feature-detection; declare your minimum via `oie.apiMin` in `plugin.json`. See [API version compatibility](#api-version-compatibility). |
 | `platform.React` | The host's React instance — `const React = platform.React` at module scope, then write JSX. Sharing it is mandatory (one instance app-wide); never `import 'react'`. |
 | `platform.reactView(Component)` | Wraps a React component as a routed-view handler for `registerView(path, platform.reactView(Component), { title })`. The component gets `{ params, query }` props. |
 | `platform.api` | Full engine REST client (`api.channels`, `api.messages`, `api.status`, … plus raw `api.get/post/put/del`). All calls share the user's session. |

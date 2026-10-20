@@ -22,8 +22,8 @@ import { formatScript, serializeTemplate } from './serialize.js';
 import { hl7Encoding, tokenizeHl7Line, hl7Tooltip, hl7FieldName } from './content-highlight.js';
 import { getActiveCompletions, getActiveLibs, onActiveLibsChange, getActiveReferences, referenceSignature, dropTextFor, cleanDesc, setActiveScope, clearActiveScope, currentScope, activeScope } from './script-completions.js';
 import { appUrl } from './deployment.js';
-// Where the server serves the vendored Monaco worker bundles. The editor bundle
-// itself is imported via the 'monaco-editor' specifier (import map / Vite).
+import { ensureEditorLanguage } from './editor-languages.js';
+// Shared vendor location for the editor bundle and workers in every deployment.
 const MONACO_VENDOR = appUrl('/vendor/monaco');
 const LOAD_TIMEOUT_MS = 10000;
 let loadPromise = null;
@@ -35,11 +35,13 @@ export function monacoFontFamily() {
     return getComputedStyle(document.documentElement).getPropertyValue('--font-mono').trim()
         || "'JetBrains Mono', ui-monospace, 'SF Mono', 'Consolas', monospace";
 }
-export function ensureMonaco() {
-    if (loadPromise)
+/** Plugin grammars load only when an editor explicitly requests their language. */
+export function ensureMonaco(language) {
+    if (!loadPromise)
+        loadPromise = loadMonaco();
+    if (!language)
         return loadPromise;
-    loadPromise = loadMonaco();
-    return loadPromise;
+    return loadPromise.then(async (monaco) => monaco && await ensureEditorLanguage(monaco, language) ? monaco : null);
 }
 // Inject the editor stylesheet emitted alongside the esbuild ESM bundle (which,
 // unlike Vite/webpack, doesn't auto-inject its CSS). Idempotent.
@@ -600,7 +602,10 @@ export function mountMonaco(monaco, editor, opts = {}) {
     editor.el.appendChild(host);
     for (const b of zoomBtns)
         editor.el.appendChild(b);
-    const lang = LANGUAGES[opts.language || 'javascript'] || 'plaintext';
+    const requestedLanguage = opts.language || 'javascript';
+    const lang = LANGUAGES[requestedLanguage]
+        || (monaco.languages.getLanguages().some(language => language.id === requestedLanguage) ? requestedLanguage : 'plaintext');
+    const tabSize = Number.isInteger(opts.tabSize) && opts.tabSize > 0 ? opts.tabSize : 4;
     if (lang === 'hl7v2')
         host.classList.add('hl7-editor');
     const instance = monaco.editor.create(host, {
@@ -616,8 +621,9 @@ export function mountMonaco(monaco, editor, opts = {}) {
         // JetBrains Mono has coding ligatures; keep them off so scripts show the
         // literal ->, !=, === (matches app.css's font-variant-ligatures: none).
         fontLigatures: false,
-        tabSize: 4,
-        insertSpaces: false,
+        tabSize,
+        insertSpaces: opts.insertSpaces ?? false,
+        ...(opts.detectIndentation === undefined ? {} : { detectIndentation: opts.detectIndentation }),
         folding: true,
         renderLineHighlight: 'line',
         fixedOverflowWidgets: true,
@@ -630,7 +636,7 @@ export function mountMonaco(monaco, editor, opts = {}) {
         wordBasedSuggestions: lang === 'javascript' ? 'off' : 'currentDocument',
         ...(opts.literalInput ? {
             lineNumbersMinChars: 2, lineDecorationsWidth: 4, folding: lang !== 'plaintext' && lang !== 'hl7v2',
-            insertSpaces: false, useTabStops: false, detectIndentation: false, autoIndent: 'none',
+            useTabStops: false, detectIndentation: false, autoIndent: 'none',
             trimAutoWhitespace: false,
             // Native EditContext can bypass the cancellable beforeinput below.
             editContext: false,
@@ -651,7 +657,7 @@ export function mountMonaco(monaco, editor, opts = {}) {
     const literalTab = opts.literalInput ? instance.addAction({
         id: 'oie.literalTab', label: 'Insert Tab', keybindings: [monaco.KeyCode.Tab],
         precondition: 'editorTextFocus && !editorReadonly && !editorTabMovesFocus',
-        run: editor => editor.trigger('literal-input', 'type', { text: '\t' })
+        run: editor => editor.trigger('literal-input', 'type', { text: opts.insertSpaces ? ' '.repeat(tabSize) : '\t' })
     }) : null;
     const literalBracket = (event) => {
         if (!event.cancelable || event.isComposing || event.inputType !== 'insertText'
@@ -684,14 +690,15 @@ export function mountMonaco(monaco, editor, opts = {}) {
     };
     const changeSub = instance.onDidChangeModelContent((e) => {
         opts.onChange && opts.onChange(instance.getValue());
-        scheduleHighlight(e.changes);
+        if (lang === 'javascript')
+            scheduleHighlight(e.changes);
     });
     highlightReservedVars(monaco, instance); // initial paint (whole document)
     // An editor with its own context takes the completion scope on focus. On
     // dispose it gives back the scope it displaced, unless another editor or
     // view has taken it since — so a modal script editor returns the scope to
     // the editor or view beneath it.
-    const scope = opts.completionScope;
+    const scope = lang === 'javascript' ? opts.completionScope : undefined;
     const holder = { token: -1, previous: null, disposed: false };
     const focusSub = scope ? instance.onDidFocusEditorText(() => {
         // Refocus retries a failed template load, but must not replace the
@@ -718,7 +725,7 @@ export function mountMonaco(monaco, editor, opts = {}) {
     // decorations don't change tokens, so this cannot loop.
     // onDidChangeTokens is real at runtime but absent from recent public typings.
     const hlModel = instance.getModel();
-    const tokenSub = hlModel ? hlModel.onDidChangeTokens((e) => {
+    const tokenSub = lang === 'javascript' && hlModel ? hlModel.onDidChangeTokens((e) => {
         for (const r of (e.ranges || [])) {
             highlightReservedVars(monaco, instance, r.fromLineNumber, r.toLineNumber);
         }

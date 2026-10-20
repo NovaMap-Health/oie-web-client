@@ -1,13 +1,19 @@
 import type * as MonacoNs from 'monaco-editor';
 export interface CodeEditorOptions {
     value?: string;
-    /** 'javascript' | 'xml' | 'sql' | 'text' | ... */
+    /** Defaults to Rhino JavaScript. Registered plugin languages load on demand. */
     language?: string;
     readOnly?: boolean;
     minHeight?: string;
     placeholder?: string;
     ariaLabel?: string;
-    /** Sample data: literal tabs and newlines, without typing assistance. */
+    /** Indentation width; defaults to four. */
+    tabSize?: number;
+    /** Insert spaces for Tab; defaults to literal tabs. */
+    insertSpaces?: boolean;
+    /** Let Monaco infer indentation from the initial text (standard editors only). */
+    detectIndentation?: boolean;
+    /** Disable automatic typing assistance while retaining the chosen indentation. */
     literalInput?: boolean;
     onChange?(value: string): void;
     /** Corner toggle opening the full-screen code view. */
