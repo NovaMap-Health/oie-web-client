@@ -306,14 +306,16 @@ export function LoginForm({ onSuccess }: any) {
                     chooseLocal(true);
                     return;
                 }
-                if (!done.ok || !done.ticket) {
+                // The engine refuses a ticket under any name but the token's own
+                // user, and the callback says which name that is.
+                if (!done.ok || !done.ticket || !done.username) {
                     setError(done.message || 'SSO sign-in failed.');
                     chooseLocal(true);
                     setSsoReauth(true);
                     return;
                 }
                 setSubmitting(true);
-                await runLogin('oidc', `oidc:ticket:${done.ticket}`, { sso: true, returnPath: done.returnPath || '/' });
+                await runLogin(done.username, `oidc:ticket:${done.ticket}`, { sso: true, returnPath: done.returnPath || '/' });
             } finally {
                 callbackInFlight.current = false;
                 setSubmitting(false);
