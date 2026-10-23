@@ -44,11 +44,13 @@ test.describe('authentication mode after interrupted SSO setup', () => {
         };
         await mockEngine(page, {
             'GET /users/current': () => state.user ? { user: state.user } : { __status: 401 },
-            'POST /extensions/oidcauth/callback': envelope({ ok: true, ticket: 'handoff-ticket', returnPath: '/' }),
+            'POST /extensions/oidcauth/callback': envelope({ ok: true, ticket: 'handoff-ticket', returnPath: '/', username: 'sso-user' }),
             'POST /users/_login': (request: any) => {
-                const username = new URLSearchParams(request.postData() || '').get('username') || '';
-                if (username !== 'oidc' && state.rejectLocal) return loginStatus('FAIL');
-                state.user = username === 'oidc' ? { id: 1, username: 'sso-user' } : { id: 2, username };
+                const form = new URLSearchParams(request.postData() || '');
+                const username = form.get('username') || '';
+                const sso = (form.get('password') || '').startsWith('oidc:ticket:');
+                if (!sso && state.rejectLocal) return loginStatus('FAIL');
+                state.user = { id: sso ? 1 : 2, username };
                 return loginStatus('SUCCESS');
             },
             'POST /users/_logout': () => { state.user = null; state.logouts++; return ''; },
@@ -208,7 +210,7 @@ async function mockSso(page: any, baseURL: string, knobs: Knobs = {}) {
         },
         'POST /extensions/oidcauth/callback': (req: any) => {
             received.callback = JSON.parse(JSON.parse(req.postData() || '{}').string);
-            return envelope(knobs.callback || { ok: true, ticket: 'ticket-1', returnPath: received.start?.return || '/' });
+            return envelope(knobs.callback || { ok: true, ticket: 'ticket-1', returnPath: received.start?.return || '/', username: 'jdoe' });
         },
         'POST /users/_login': (req: any) => {
             received.logins.push(Object.fromEntries(new URLSearchParams(req.postData() || '')));
@@ -235,6 +237,8 @@ test.describe('SSO through the engine', () => {
         expect(received.callback).toEqual({ code: 'code-1', state: 'state-1' });
         expect(received.logins).toHaveLength(1);
         expect(received.logins[0].password).toBe('oidc:ticket:ticket-1');   // the ticket IS the credential
+        // Redeemed under the name the callback gave: the engine refuses any other.
+        expect(received.logins[0].username).toBe('jdoe');
         // The provider's code is gone from the address bar, and the session is marked as SSO.
         await expect(page).toHaveURL(/\/dashboard$/);
         expect(new URL(page.url()).search).toBe('');
@@ -300,6 +304,17 @@ test.describe('SSO through the engine', () => {
         await returned;
         await expect(page.getByText('SSO sign-in could not be completed. Try again, or use local sign-in.')).toBeVisible({ timeout: 15_000 });
         await expect(page.locator('input[type=password]')).toBeVisible();
+    });
+
+    test('a callback answer without a username is not redeemed', async ({ page, baseURL }) => {
+        const received = await mockSso(page, baseURL!, { callback: { ok: true, ticket: 'ticket-1', returnPath: '/' } });
+        await page.goto('/');
+        const returned = page.waitForURL(/\/oidc\/callback\?/, { waitUntil: 'commit' });
+        await page.getByRole('button', { name: 'Sign in with Acme SSO' }).click();
+        await returned;
+        await expect(page.getByText('SSO sign-in failed.')).toBeVisible({ timeout: 15_000 });
+        await expect(page.locator('input[type=password]')).toBeVisible();
+        expect(received.logins).toHaveLength(0);
     });
 
     test("the engine's refusal at login names its reason even without a message", async ({ page, baseURL }) => {
