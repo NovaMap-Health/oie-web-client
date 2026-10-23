@@ -163,10 +163,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: gibson9583/oie-web-support-plugin
-          # Coordinated Web Support 1.2.0, including extension vocabularies and
-          # custom response variables. Keep this immutable pin aligned with the
+          # Released Web Support 1.2.0 API implementation, also used by 1.2.1.
+          # Includes extension vocabularies and custom response variables.
+          # Keep this immutable pin aligned with the
           # companion release candidate before tagging the client.
-          ref: ddca7440b708c65686777c5236e5e7058aa59e8c
+          ref: 871dcd2985974f8c2c4da3363435ec44ee4438a0
           path: release-artifacts/websupport
       - name: Test and package the pinned companion API with this WAR
         run: |

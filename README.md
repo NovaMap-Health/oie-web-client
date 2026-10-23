@@ -432,8 +432,8 @@ tagging Web Support. Its release pipeline consumes the client version declared
 by `webclient.version`, verifies the WAR checksum and receipt against the client
 tag, signs the plugin JAR, and checks the bundled WAR remains byte-identical.
 The signed `websupport-X.Y.Z.zip` and `SHA256SUMS` are then published, followed
-by the automated community-catalog PR. Pair Web Client 1.2.0 with Web Support
-1.2.0 for the coordinated release.
+by the automated community-catalog PR. Pair Web Client 1.2.1 with Web Support
+1.2.1 for the coordinated release.
 
 Git supplies only the build *metadata* beside it (commit, build date, and a
 `dirty` flag when the tree had uncommitted changes), stamped into a gitignored
